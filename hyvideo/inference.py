@@ -140,6 +140,15 @@ class Inference(object):
         self.logger = logger
         self.parallel_args = parallel_args
 
+        # Metrics tracking
+        self.metrics = {
+            'gpu_memory_peak': 0,
+            'gpu_memory_allocated': [],
+            'cpu_memory_used': [],
+            'step_times': [],
+            'total_time': 0
+        }
+
     @classmethod
     def from_pretrained(cls, pretrained_model_path, args, device=None, **kwargs):
         """

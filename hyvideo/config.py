@@ -254,6 +254,22 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use CPU offload for the model load.",
     )
+    group.add_argument(
+        "--layer-offload",
+        action="store_true",
+        help="Enable layer-by-layer CPU offloading during inference.",
+    )
+    group.add_argument(
+        "--offload-blocks",
+        type=str,
+        default="",
+        help="Comma-separated block indices to offload (e.g., '0,1,2' for first 3 double blocks).",
+    )
+    group.add_argument(
+        "--collect-metrics",
+        action="store_true",
+        help="Collect memory and timing metrics during inference.",
+    )
 
     # ======================== Inference general setting ========================
     group.add_argument(

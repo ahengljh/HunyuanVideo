@@ -956,11 +956,24 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # Metrics collection
+        import psutil
+        collect_metrics = getattr(self.args, 'collect_metrics', False)
+        metrics = {
+            'gpu_memory_peak': 0,
+            'gpu_memory_per_step': [],
+            'cpu_memory_per_step': [],
+            'step_times': []
+        }
+
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                import time
+                step_start = time.time()
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1034,6 +1047,19 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         "negative_prompt_embeds", negative_prompt_embeds
                     )
 
+                # Collect metrics
+                if collect_metrics:
+                    step_time = time.time() - step_start
+                    metrics['step_times'].append(step_time)
+
+                    if torch.cuda.is_available():
+                        gpu_mem = torch.cuda.max_memory_allocated(device) / (1024**3)  # GB
+                        metrics['gpu_memory_per_step'].append(gpu_mem)
+                        metrics['gpu_memory_peak'] = max(metrics['gpu_memory_peak'], gpu_mem)
+
+                    cpu_mem = psutil.Process().memory_info().rss / (1024**3)  # GB
+                    metrics['cpu_memory_per_step'].append(cpu_mem)
+
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
@@ -1093,6 +1119,21 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         # Offload all models
         self.maybe_free_model_hooks()
+
+        # Log metrics if collection is enabled
+        if collect_metrics:
+            logger.info("=" * 60)
+            logger.info("PERFORMANCE METRICS")
+            logger.info("=" * 60)
+            logger.info(f"GPU Memory Peak: {metrics['gpu_memory_peak']:.2f} GB")
+            if len(metrics['gpu_memory_per_step']) > 0:
+                logger.info(f"GPU Memory Avg: {sum(metrics['gpu_memory_per_step'])/len(metrics['gpu_memory_per_step']):.2f} GB")
+            if len(metrics['cpu_memory_per_step']) > 0:
+                logger.info(f"CPU Memory Peak: {max(metrics['cpu_memory_per_step']):.2f} GB")
+            if len(metrics['step_times']) > 0:
+                logger.info(f"Avg Step Time: {sum(metrics['step_times'])/len(metrics['step_times']):.3f}s")
+                logger.info(f"Total Time: {sum(metrics['step_times']):.2f}s")
+            logger.info("=" * 60)
 
         if not return_dict:
             return image

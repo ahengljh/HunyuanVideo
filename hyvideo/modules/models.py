@@ -478,6 +478,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.guidance_embed = guidance_embed
         self.rope_dim_list = rope_dim_list
 
+        # Layer offloading configuration
+        self.layer_offload = getattr(args, 'layer_offload', False)
+        self.offload_blocks = []
+        if hasattr(args, 'offload_blocks') and args.offload_blocks:
+            self.offload_blocks = [int(x.strip()) for x in args.offload_blocks.split(',')]
+
         # Text projection. Default to linear projection.
         # Alternative: TokenRefiner. See more details (LI-DiT): http://arxiv.org/abs/2406.11831
         self.use_attention_mask = use_attention_mask
@@ -652,7 +658,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
+        for idx, block in enumerate(self.double_blocks):
+            # Layer offloading: move block to GPU before forward pass
+            if self.layer_offload and idx in self.offload_blocks:
+                block.to(img.device)
+
             double_block_args = [
                 img,
                 txt,
@@ -666,10 +676,20 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
             img, txt = block(*double_block_args)
 
+            # Layer offloading: move block back to CPU after forward pass
+            if self.layer_offload and idx in self.offload_blocks:
+                block.to('cpu')
+                torch.cuda.empty_cache()
+
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
         if len(self.single_blocks) > 0:
-            for _, block in enumerate(self.single_blocks):
+            for idx, block in enumerate(self.single_blocks):
+                # Layer offloading for single blocks (offset by double blocks count)
+                single_idx = len(self.double_blocks) + idx
+                if self.layer_offload and single_idx in self.offload_blocks:
+                    block.to(x.device)
+
                 single_block_args = [
                     x,
                     vec,
@@ -682,6 +702,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 ]
 
                 x = block(*single_block_args)
+
+                # Layer offloading: move block back to CPU after forward pass
+                if self.layer_offload and single_idx in self.offload_blocks:
+                    block.to('cpu')
+                    torch.cuda.empty_cache()
 
         img = x[:, :img_seq_len, ...]
 
