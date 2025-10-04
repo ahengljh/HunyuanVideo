@@ -38,6 +38,8 @@ def parse_benchmark_args():
                        help="Experimental weight sharing map passed through to inference")
     parser.add_argument("--prefetch-offload", action="store_true",
                        help="Enable asynchronous prefetching during offload runs")
+    parser.add_argument("--int8-cache-offload", action="store_true",
+                       help="Enable int8 GPU cache for offloaded blocks")
 
     return parser.parse_args()
 
@@ -179,6 +181,7 @@ def main():
         'collect-metrics': True,
         'layer-share-map': args.layer_share_map,
         'prefetch-offload': args.prefetch_offload,
+        'int8-cache-offload': args.int8_cache_offload,
     }
 
     # Run 1: Baseline (no offloading)

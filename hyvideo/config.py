@@ -281,6 +281,11 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Asynchronously prefetch offloaded transformer blocks to overlap compute and transfers.",
     )
     group.add_argument(
+        "--int8-cache-offload",
+        action="store_true",
+        help="Keep int8 weight caches on GPU for offloaded blocks to reduce PCIe traffic.",
+    )
+    group.add_argument(
         "--layer-share-map",
         type=str,
         default="",

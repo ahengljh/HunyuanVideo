@@ -16,6 +16,7 @@ This modification adds CPU memory offloading capabilities to HunyuanVideo for re
 - `--collect-metrics`: Collect and display memory and timing metrics
 - `--layer-share-map`: Experimental weight sharing map (e.g., `"25->5,26->6"`) to reuse earlier block weights
 - `--prefetch-offload`: Enable asynchronous GPU prefetching of offloaded blocks for better overlap
+- `--int8-cache-offload`: Keep int8 caches of offloaded weights on GPU to cut transfer volume
 
 ## Usage
 

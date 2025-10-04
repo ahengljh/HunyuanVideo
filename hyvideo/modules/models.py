@@ -483,6 +483,9 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.prefetch_offload = (
             bool(getattr(args, "prefetch_offload", False)) and torch.cuda.is_available()
         )
+        self.int8_cache_offload = (
+            bool(getattr(args, "int8_cache_offload", False)) and torch.cuda.is_available()
+        )
         raw_offload_blocks = getattr(args, "offload_blocks", "")
         self.offload_blocks = set()
         if isinstance(raw_offload_blocks, str) and raw_offload_blocks.strip():
@@ -687,6 +690,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.single_blocks = nn.ModuleList(single_blocks)
 
         default_device = self._normalize_device(device)
+        self._int8_cache: Dict[int, Dict[str, Any]] = {}
+
         for block in self.double_blocks:
             block._hy_device = default_device
         for block in self.single_blocks:
@@ -734,12 +739,40 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         non_blocking = bool(non_blocking and target_device.type == "cuda")
         pin_memory = bool(pin_memory and target_device.type == "cpu")
 
+        cache = self._int8_cache.get(id(block)) if self.int8_cache_offload else None
+        use_cache = (
+            cache is not None
+            and target_device.type == "cuda"
+        )
+
+        if use_cache:
+            cache_device = cache.get("_device")
+            if cache_device is None or cache_device != target_device:
+                for key, entry in list(cache.items()):
+                    if key == "_device":
+                        continue
+                    entry["tensor"] = entry["tensor"].to(target_device, non_blocking=True)
+                    entry["scale"] = entry["scale"].to(target_device, non_blocking=True)
+                cache["_device"] = target_device
+
         with torch.no_grad():
-            for param in block.parameters():
-                data = param.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory:
-                    data = data.pin_memory()
-                param.data = data
+            if use_cache:
+                for name, param in block.named_parameters():
+                    entry = cache.get(name)
+                    if entry is None:
+                        data = param.data.to(target_device, non_blocking=non_blocking)
+                    else:
+                        q_tensor = entry["tensor"].to(dtype=torch.float32)
+                        scale = entry["scale"]
+                        data = (q_tensor * scale).to(param.dtype)
+                    param.data = data
+            else:
+                for param in block.parameters():
+                    data = param.data.to(target_device, non_blocking=non_blocking)
+                    if pin_memory:
+                        data = data.pin_memory()
+                    param.data = data
+
             for buffer in block.buffers():
                 if buffer is None or not torch.is_tensor(buffer):
                     continue
@@ -750,13 +783,48 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         block._hy_device = target_device
 
-    def _move_block_to_cpu(self, block: nn.Module) -> None:
+    def _move_block_to_cpu(
+        self,
+        block: nn.Module,
+        cache_device: Optional[torch.device] = None,
+    ) -> None:
+        if (
+            self.int8_cache_offload
+            and cache_device is not None
+            and cache_device.type == "cuda"
+        ):
+            self._ensure_int8_cache(block, cache_device)
+
         self._move_block_to_device(
             block,
             torch.device("cpu"),
             non_blocking=False,
             pin_memory=self.prefetch_offload,
         )
+
+    def _ensure_int8_cache(
+        self, block: nn.Module, device: torch.device
+    ) -> None:
+        cache = self._int8_cache.setdefault(id(block), {})
+        cache_device = cache.get("_device")
+        if cache_device is not None and cache_device != device:
+            cache.clear()
+
+        with torch.no_grad():
+            for name, param in block.named_parameters():
+                if name in cache:
+                    continue
+                param_fp32 = param.data.detach().to(torch.float32)
+                max_abs = param_fp32.abs().amax()
+                scale = torch.clamp(max_abs / 127.0, min=1e-8)
+                quantized = torch.round(param_fp32 / scale).clamp(-127, 127).to(torch.int8)
+                cache[name] = {
+                    "tensor": quantized.to(device, non_blocking=True),
+                    "scale": scale.to(device, non_blocking=True),
+                    "dtype": param.dtype,
+                }
+
+        cache["_device"] = device
 
     def _find_next_offload_index(self, start_idx: int) -> Optional[int]:
         total_blocks = len(self.double_blocks) + len(self.single_blocks)
@@ -890,7 +958,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     else:
                         pending_prefetch = None
 
-                self._move_block_to_cpu(block)
+                cache_device = img.device if img.device.type == "cuda" else None
+                self._move_block_to_cpu(block, cache_device)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -939,7 +1008,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         else:
                             pending_prefetch = None
 
-                    self._move_block_to_cpu(block)
+                    cache_device = x.device if x.device.type == "cuda" else None
+                    self._move_block_to_cpu(block, cache_device)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 

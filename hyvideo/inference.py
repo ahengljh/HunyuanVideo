@@ -216,6 +216,12 @@ class Inference(object):
             )
             logger.debug(f"Layer share map: {share_map}")
 
+        if getattr(model, "int8_cache_offload", False):
+            logger.info(
+                "Int8 cache offload enabled for %d configured blocks",
+                len(model.offload_blocks),
+            )
+
         # ============================= Build extra models ========================
         # VAE
         vae, _, s_ratio, t_ratio = load_vae(
