@@ -17,6 +17,8 @@ This modification adds CPU memory offloading capabilities to HunyuanVideo for re
 - `--layer-share-map`: Experimental weight sharing map (e.g., `"25->5,26->6"`) to reuse earlier block weights
 - `--prefetch-offload`: Enable asynchronous GPU prefetching of offloaded blocks for better overlap
 - `--int8-cache-offload`: Keep int8 caches of offloaded weights on GPU to cut transfer volume
+- `--share-adapter-rank`: Optional low-rank residual adapter size for shared blocks (set to >0 to enable)
+- `--share-adapter-scale`: Scale factor applied to residual adapters on shared blocks
 
 ## Usage
 
@@ -108,6 +110,8 @@ python sample_video.py \
 ```
 
 The example above reuses the weights of double blocks 5-7 for blocks 25-27, trimming resident parameters while keeping the latency benefits of layer offloading.
+
+Set `--share-adapter-rank` to a small value (e.g., 32) to attach low-rank residual adapters to the shared blocks, with `--share-adapter-scale` controlling their contribution. Adapter energy statistics are reported under `adapter_energy` in the collected metrics.
 
 ## Example Workflow
 

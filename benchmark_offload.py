@@ -40,6 +40,10 @@ def parse_benchmark_args():
                        help="Enable asynchronous prefetching during offload runs")
     parser.add_argument("--int8-cache-offload", action="store_true",
                        help="Enable int8 GPU cache for offloaded blocks")
+    parser.add_argument("--share-adapter-rank", type=int, default=0,
+                       help="Low-rank adapter size for shared blocks (0 disables)")
+    parser.add_argument("--share-adapter-scale", type=float, default=1.0,
+                       help="Residual adapter scale for shared blocks")
 
     return parser.parse_args()
 
@@ -182,6 +186,8 @@ def main():
         'layer-share-map': args.layer_share_map,
         'prefetch-offload': args.prefetch_offload,
         'int8-cache-offload': args.int8_cache_offload,
+        'share-adapter-rank': args.share_adapter_rank,
+        'share-adapter-scale': args.share_adapter_scale,
     }
 
     # Run 1: Baseline (no offloading)

@@ -393,6 +393,57 @@ class MMSingleStreamBlock(nn.Module):
         return x + apply_gate(output, gate=mod_gate)
 
 
+class ResidualDoubleAdapter(nn.Module):
+    def __init__(self, hidden_size: int, rank: int, scale: float):
+        super().__init__()
+        self.scale = scale
+
+        self.img_norm = nn.LayerNorm(hidden_size)
+        self.txt_norm = nn.LayerNorm(hidden_size)
+
+        self.img_down = nn.Linear(hidden_size, rank, bias=False)
+        self.img_up = nn.Linear(rank, hidden_size, bias=False)
+        self.txt_down = nn.Linear(hidden_size, rank, bias=False)
+        self.txt_up = nn.Linear(rank, hidden_size, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.img_down.weight)
+        nn.init.zeros_(self.img_up.weight)
+        nn.init.zeros_(self.txt_down.weight)
+        nn.init.zeros_(self.txt_up.weight)
+
+    def forward(
+        self, img: torch.Tensor, txt: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        img_delta = self.img_up(self.img_down(self.img_norm(img))) * self.scale
+        txt_delta = self.txt_up(self.txt_down(self.txt_norm(txt))) * self.scale
+        energy = (img_delta.pow(2).mean() + txt_delta.pow(2).mean())
+        return img + img_delta, txt + txt_delta, energy
+
+
+class ResidualSingleAdapter(nn.Module):
+    def __init__(self, hidden_size: int, rank: int, scale: float):
+        super().__init__()
+        self.scale = scale
+
+        self.norm = nn.LayerNorm(hidden_size)
+        self.down = nn.Linear(hidden_size, rank, bias=False)
+        self.up = nn.Linear(rank, hidden_size, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.down.weight)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        delta = self.up(self.down(self.norm(x))) * self.scale
+        energy = delta.pow(2).mean()
+        return x + delta, energy
+
+
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
     """
     HunyuanVideo Transformer backbone
@@ -697,6 +748,28 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         for block in self.single_blocks:
             block._hy_device = default_device
 
+        self.share_adapter_rank = int(getattr(args, "share_adapter_rank", 0) or 0)
+        self.share_adapter_scale = float(getattr(args, "share_adapter_scale", 1.0))
+        self.share_adapters = nn.ModuleDict()
+        if self.share_adapter_rank > 0 and self.layer_share_map:
+            for target_idx in sorted(self.layer_share_map.keys()):
+                if target_idx < len(self.double_blocks):
+                    adapter = ResidualDoubleAdapter(
+                        self.hidden_size,
+                        self.share_adapter_rank,
+                        self.share_adapter_scale,
+                    )
+                else:
+                    adapter = ResidualSingleAdapter(
+                        self.hidden_size,
+                        self.share_adapter_rank,
+                        self.share_adapter_scale,
+                    )
+                self.share_adapters[str(target_idx)] = adapter
+                adapter._hy_device = default_device
+        self._share_adapter_indices = {int(k) for k in self.share_adapters.keys()}
+        self._adapter_last_energy: Optional[float] = None
+
         self.final_layer = FinalLayer(
             self.hidden_size,
             self.patch_size,
@@ -821,7 +894,6 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 cache[name] = {
                     "tensor": quantized.to(device, non_blocking=True),
                     "scale": scale.to(device, non_blocking=True),
-                    "dtype": param.dtype,
                 }
 
         cache["_device"] = device
@@ -915,6 +987,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             torch.cuda.Stream(device=device_index) if prefetch_enabled else None
         )
         pending_prefetch: Optional[Tuple[int, nn.Module]] = None
+        adapter_energy: Optional[torch.Tensor] = None
 
         for idx, block in enumerate(self.double_blocks):
             global_idx = idx
@@ -940,6 +1013,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             ]
 
             img, txt = block(*double_block_args)
+
+            if self._share_adapter_indices and global_idx in self._share_adapter_indices:
+                adapter = self.share_adapters[str(global_idx)]
+                adapter_device = getattr(adapter, "_hy_device", None)
+                if adapter_device != img.device:
+                    adapter.to(img.device)
+                    adapter._hy_device = img.device
+                img, txt, energy = adapter(img, txt)
+                adapter_energy = energy if adapter_energy is None else adapter_energy + energy
 
             # Layer offloading: move block back to CPU after forward pass
             if should_offload:
@@ -991,6 +1073,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
                 x = block(*single_block_args)
 
+                if self._share_adapter_indices and single_idx in self._share_adapter_indices:
+                    adapter = self.share_adapters[str(single_idx)]
+                    adapter_device = getattr(adapter, "_hy_device", None)
+                    if adapter_device != x.device:
+                        adapter.to(x.device)
+                        adapter._hy_device = x.device
+                    x, energy = adapter(x)
+                    adapter_energy = energy if adapter_energy is None else adapter_energy + energy
+
                 # Layer offloading: move block back to CPU after forward pass
                 if should_offload:
                     if prefetch_enabled:
@@ -1014,6 +1105,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         torch.cuda.empty_cache()
 
         img = x[:, :img_seq_len, ...]
+
+        if adapter_energy is not None:
+            self._adapter_last_energy = adapter_energy.detach().cpu().item()
+        else:
+            self._adapter_last_energy = 0.0
 
         # ---------------------------- Final layer ------------------------------
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)

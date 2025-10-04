@@ -1159,6 +1159,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 else 0.0
             )
             peak_cpu = max(metrics["cpu_memory_used"]) if metrics["cpu_memory_used"] else 0.0
+            adapter_energy = getattr(self.transformer, "_adapter_last_energy", None)
+            if adapter_energy is not None:
+                metrics["adapter_energy"] = adapter_energy
 
             logger.info("=" * 60)
             logger.info("PERFORMANCE METRICS")
@@ -1174,6 +1177,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     f"Avg Step Time: {total_time / len(metrics['step_times']):.3f}s"
                 )
                 logger.info(f"Total Time: {total_time:.2f}s")
+            if adapter_energy is not None and adapter_energy > 0:
+                logger.info(f"Adapter Energy: {adapter_energy:.6f}")
             logger.info("=" * 60)
 
             metrics["total_time"] = total_time
