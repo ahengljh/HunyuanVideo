@@ -7,12 +7,15 @@ This modification adds CPU memory offloading capabilities to HunyuanVideo for re
 1. **Layer-by-Layer CPU Offloading**: Selectively offload specific transformer blocks to CPU during inference
 2. **Metrics Collection**: Track GPU/CPU memory usage and inference timing
 3. **Benchmark Script**: Compare performance with and without offloading
+4. **Weight Sharing (Experimental)**: Reuse transformer block weights across layers to shrink resident model memory
 
 ## New Command-Line Arguments
 
 - `--layer-offload`: Enable layer-by-layer CPU offloading during inference
 - `--offload-blocks`: Comma-separated block indices to offload (e.g., "0,1,2,3,4")
 - `--collect-metrics`: Collect and display memory and timing metrics
+- `--layer-share-map`: Experimental weight sharing map (e.g., `"25->5,26->6"`) to reuse earlier block weights
+- `--prefetch-offload`: Enable asynchronous GPU prefetching of offloaded blocks for better overlap
 
 ## Usage
 
@@ -54,6 +57,7 @@ This will:
 - `--skip-baseline`: Skip the baseline run
 - `--skip-offload`: Skip the offload run
 - `--offload-blocks`: Which blocks to offload (default: "0,1,2,3,4")
+- `--layer-share-map`: Weight sharing map applied during both runs
 
 ## Understanding Block Offloading
 
@@ -85,6 +89,24 @@ Example configurations:
 2. **Monitor metrics**: Use `--collect-metrics` to see exact memory/time tradeoffs
 3. **Adjust based on GPU**: More VRAM → offload fewer blocks
 4. **Lower resolution**: Combine with smaller `--video-size` for maximum memory savings
+5. **Leverage weight sharing**: Use `--layer-share-map` to tie late blocks to earlier ones when minor quality loss is acceptable
+
+### Weight Sharing Example (Experimental)
+
+```bash
+python sample_video.py \
+    --video-size 544 960 \
+    --video-length 129 \
+    --infer-steps 30 \
+    --prompt "A cat walks on the grass, realistic style." \
+    --flow-reverse \
+    --layer-offload \
+    --offload-blocks "0,1,2,3,4" \
+    --layer-share-map "25->5,26->6,27->7" \
+    --collect-metrics
+```
+
+The example above reuses the weights of double blocks 5-7 for blocks 25-27, trimming resident parameters while keeping the latency benefits of layer offloading.
 
 ## Example Workflow
 

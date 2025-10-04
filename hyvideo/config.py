@@ -13,7 +13,12 @@ def parse_args(namespace=None):
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
 
-    args = parser.parse_args(namespace=namespace)
+    parse_kwargs = {}
+    if isinstance(namespace, (list, tuple)):
+        parse_kwargs["args"] = list(namespace)
+        namespace = None
+
+    args = parser.parse_args(namespace=namespace, **parse_kwargs)
     args = sanity_check_args(args)
 
     return args
@@ -269,6 +274,20 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "--collect-metrics",
         action="store_true",
         help="Collect memory and timing metrics during inference.",
+    )
+    group.add_argument(
+        "--prefetch-offload",
+        action="store_true",
+        help="Asynchronously prefetch offloaded transformer blocks to overlap compute and transfers.",
+    )
+    group.add_argument(
+        "--layer-share-map",
+        type=str,
+        default="",
+        help=(
+            "Weight-sharing map across transformer blocks. Format: 'target->source' pairs "
+            "separated by commas, using global block indices (double blocks first)."
+        ),
     )
 
     # ======================== Inference general setting ========================

@@ -34,6 +34,10 @@ def parse_benchmark_args():
                        help="Skip baseline (no offloading) run")
     parser.add_argument("--skip-offload", action="store_true",
                        help="Skip offload run")
+    parser.add_argument("--layer-share-map", type=str, default="",
+                       help="Experimental weight sharing map passed through to inference")
+    parser.add_argument("--prefetch-offload", action="store_true",
+                       help="Enable asynchronous prefetching during offload runs")
 
     return parser.parse_args()
 
@@ -60,7 +64,7 @@ def run_inference(args_dict, run_name, output_dir):
             arg_list.append(f"--{key}")
             arg_list.append(str(value))
 
-    args = parse_args(namespace=arg_list)
+    args = parse_args(arg_list)
 
     # Initialize sampler
     models_root_path = Path(args.model_base)
@@ -116,6 +120,26 @@ def run_inference(args_dict, run_name, output_dir):
         metrics['gpu_memory_peak_gb'] = torch.cuda.max_memory_allocated() / (1024**3)
         metrics['gpu_memory_reserved_gb'] = torch.cuda.max_memory_reserved() / (1024**3)
 
+    sampler_metrics = getattr(hunyuan_video_sampler, "metrics", None)
+    if sampler_metrics:
+        metrics['offload_metrics'] = sampler_metrics
+        if sampler_metrics.get('gpu_memory_peak'):
+            metrics['gpu_memory_peak_gb'] = max(
+                metrics.get('gpu_memory_peak_gb', 0.0),
+                sampler_metrics['gpu_memory_peak']
+            )
+        if sampler_metrics.get('cpu_memory_used'):
+            metrics['cpu_memory_peak_gb'] = max(sampler_metrics['cpu_memory_used'])
+        if sampler_metrics.get('step_times'):
+            step_times = sampler_metrics['step_times']
+            metrics['avg_step_time_s'] = (
+                sum(step_times) / len(step_times)
+                if step_times else 0.0
+            )
+
+        if sampler_metrics.get('total_time') is not None:
+            metrics['pipeline_total_time_s'] = sampler_metrics['total_time']
+
     # Save video
     samples = outputs['samples']
     if samples:
@@ -153,6 +177,8 @@ def main():
         'seed': args.seed,
         'flow-reverse': True,
         'collect-metrics': True,
+        'layer-share-map': args.layer_share_map,
+        'prefetch-offload': args.prefetch_offload,
     }
 
     # Run 1: Baseline (no offloading)

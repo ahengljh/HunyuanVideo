@@ -140,14 +140,8 @@ class Inference(object):
         self.logger = logger
         self.parallel_args = parallel_args
 
-        # Metrics tracking
-        self.metrics = {
-            'gpu_memory_peak': 0,
-            'gpu_memory_allocated': [],
-            'cpu_memory_used': [],
-            'step_times': [],
-            'total_time': 0
-        }
+        # Metrics tracking (populated after `predict` calls)
+        self.metrics = {}
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, args, device=None, **kwargs):
@@ -211,6 +205,16 @@ class Inference(object):
         model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
+
+        share_map = getattr(model, "layer_share_map", None)
+        if share_map:
+            unique_double = len({id(block) for block in model.double_blocks})
+            unique_single = len({id(block) for block in model.single_blocks})
+            logger.info(
+                f"Layer weight sharing active: {unique_double} unique double blocks / {len(model.double_blocks)} total, "
+                f"{unique_single} unique single blocks / {len(model.single_blocks)} total"
+            )
+            logger.debug(f"Layer share map: {share_map}")
 
         # ============================= Build extra models ========================
         # VAE
@@ -678,5 +682,15 @@ class HunyuanVideoSampler(Inference):
 
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
+
+        pipeline_metrics = getattr(self.pipeline, "_latest_metrics", None)
+        if pipeline_metrics:
+            # Copy to decouple from pipeline state in case of subsequent updates
+            self.metrics = dict(pipeline_metrics)
+
+            # Fall back to wall-clock timing if pipeline metrics are missing
+            self.metrics.setdefault("total_time", gen_time)
+        else:
+            self.metrics = {"total_time": gen_time}
 
         return out_dict

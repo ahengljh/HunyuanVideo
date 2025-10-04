@@ -479,10 +479,110 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.rope_dim_list = rope_dim_list
 
         # Layer offloading configuration
-        self.layer_offload = getattr(args, 'layer_offload', False)
-        self.offload_blocks = []
-        if hasattr(args, 'offload_blocks') and args.offload_blocks:
-            self.offload_blocks = [int(x.strip()) for x in args.offload_blocks.split(',')]
+        self.layer_offload = bool(getattr(args, "layer_offload", False))
+        self.prefetch_offload = (
+            bool(getattr(args, "prefetch_offload", False)) and torch.cuda.is_available()
+        )
+        raw_offload_blocks = getattr(args, "offload_blocks", "")
+        self.offload_blocks = set()
+        if isinstance(raw_offload_blocks, str) and raw_offload_blocks.strip():
+            for token in raw_offload_blocks.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    self.offload_blocks.add(int(token))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid block index '{token}' received in --offload-blocks"
+                    ) from exc
+        elif isinstance(raw_offload_blocks, (list, tuple, set)):
+            for token in raw_offload_blocks:
+                try:
+                    self.offload_blocks.add(int(token))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid block index '{token}' received in --offload-blocks"
+                    ) from exc
+
+        # Weight sharing configuration (experimental memory compression)
+        total_block_count = mm_double_blocks_depth + mm_single_blocks_depth
+        raw_share_map = getattr(args, "layer_share_map", "")
+        self.layer_share_map: Dict[int, int] = {}
+        self._double_share_map: Dict[int, int] = {}
+        self._single_share_map: Dict[int, int] = {}
+        if isinstance(raw_share_map, str) and raw_share_map.strip():
+            share_pairs = [pair.strip() for pair in raw_share_map.split(",") if pair.strip()]
+            for pair in share_pairs:
+                if "->" in pair:
+                    target_str, source_str = pair.split("->", 1)
+                elif ":" in pair:
+                    target_str, source_str = pair.split(":", 1)
+                else:
+                    raise ValueError(
+                        "Invalid format for --layer-share-map. Use 'target->source' pairs separated by commas."
+                    )
+
+                try:
+                    target_idx = int(target_str.strip())
+                    source_idx = int(source_str.strip())
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid block index in --layer-share-map entry '{pair}'."
+                    ) from exc
+
+                if not (0 <= target_idx < total_block_count) or not (0 <= source_idx < total_block_count):
+                    raise ValueError(
+                        f"Block indices out of range in --layer-share-map entry '{pair}'."
+                    )
+                if target_idx == source_idx:
+                    raise ValueError(
+                        f"Cannot map block {target_idx} to itself in --layer-share-map."
+                    )
+                if target_idx in self.layer_share_map:
+                    raise ValueError(
+                        f"Duplicate target index {target_idx} in --layer-share-map."
+                    )
+                if source_idx > target_idx:
+                    raise ValueError(
+                        f"Source index must precede target index for '{pair}' to avoid recursive ties."
+                    )
+
+                target_is_double = target_idx < mm_double_blocks_depth
+                source_is_double = source_idx < mm_double_blocks_depth
+                if target_is_double != source_is_double:
+                    raise ValueError(
+                        f"Cannot share weights across double/single block types for entry '{pair}'."
+                    )
+
+                if target_is_double:
+                    local_target = target_idx
+                    local_source = source_idx
+                    if local_source >= mm_double_blocks_depth:
+                        raise ValueError(
+                            f"Source index {source_idx} invalid for double block entry '{pair}'."
+                        )
+                    if local_source >= local_target:
+                        raise ValueError(
+                            f"Double block targets must map to an earlier block for entry '{pair}'."
+                        )
+                    self._double_share_map[local_target] = local_source
+                else:
+                    local_target = target_idx - mm_double_blocks_depth
+                    local_source = source_idx - mm_double_blocks_depth
+                    if local_target >= mm_single_blocks_depth or local_source < 0:
+                        raise ValueError(
+                            f"Source index {source_idx} invalid for single block entry '{pair}'."
+                        )
+                    if local_source >= local_target:
+                        raise ValueError(
+                            f"Single block targets must map to an earlier block for entry '{pair}'."
+                        )
+                    self._single_share_map[local_target] = local_source
+
+                self.layer_share_map[target_idx] = source_idx
+        elif raw_share_map:
+            raise ValueError("--layer-share-map must be provided as a string of mappings.")
 
         # Text projection. Default to linear projection.
         # Alternative: TokenRefiner. See more details (LI-DiT): http://arxiv.org/abs/2406.11831
@@ -546,37 +646,51 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         )
 
         # double blocks
-        self.double_blocks = nn.ModuleList(
-            [
-                MMDoubleStreamBlock(
-                    self.hidden_size,
-                    self.heads_num,
-                    mlp_width_ratio=mlp_width_ratio,
-                    mlp_act_type=mlp_act_type,
-                    qk_norm=qk_norm,
-                    qk_norm_type=qk_norm_type,
-                    qkv_bias=qkv_bias,
-                    **factory_kwargs,
+        double_blocks: List[MMDoubleStreamBlock] = []
+        for idx in range(mm_double_blocks_depth):
+            share_source = self._double_share_map.get(idx)
+            if share_source is not None:
+                double_blocks.append(double_blocks[share_source])
+            else:
+                double_blocks.append(
+                    MMDoubleStreamBlock(
+                        self.hidden_size,
+                        self.heads_num,
+                        mlp_width_ratio=mlp_width_ratio,
+                        mlp_act_type=mlp_act_type,
+                        qk_norm=qk_norm,
+                        qk_norm_type=qk_norm_type,
+                        qkv_bias=qkv_bias,
+                        **factory_kwargs,
+                    )
                 )
-                for _ in range(mm_double_blocks_depth)
-            ]
-        )
+        self.double_blocks = nn.ModuleList(double_blocks)
 
         # single blocks
-        self.single_blocks = nn.ModuleList(
-            [
-                MMSingleStreamBlock(
-                    self.hidden_size,
-                    self.heads_num,
-                    mlp_width_ratio=mlp_width_ratio,
-                    mlp_act_type=mlp_act_type,
-                    qk_norm=qk_norm,
-                    qk_norm_type=qk_norm_type,
-                    **factory_kwargs,
+        single_blocks: List[MMSingleStreamBlock] = []
+        for idx in range(mm_single_blocks_depth):
+            share_source = self._single_share_map.get(idx)
+            if share_source is not None:
+                single_blocks.append(single_blocks[share_source])
+            else:
+                single_blocks.append(
+                    MMSingleStreamBlock(
+                        self.hidden_size,
+                        self.heads_num,
+                        mlp_width_ratio=mlp_width_ratio,
+                        mlp_act_type=mlp_act_type,
+                        qk_norm=qk_norm,
+                        qk_norm_type=qk_norm_type,
+                        **factory_kwargs,
+                    )
                 )
-                for _ in range(mm_single_blocks_depth)
-            ]
-        )
+        self.single_blocks = nn.ModuleList(single_blocks)
+
+        default_device = self._normalize_device(device)
+        for block in self.double_blocks:
+            block._hy_device = default_device
+        for block in self.single_blocks:
+            block._hy_device = default_device
 
         self.final_layer = FinalLayer(
             self.hidden_size,
@@ -597,6 +711,67 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             block.disable_deterministic()
         for block in self.single_blocks:
             block.disable_deterministic()
+
+    def _normalize_device(self, device: Optional[Union[str, torch.device]]) -> torch.device:
+        if isinstance(device, torch.device):
+            return device
+        if device is None:
+            return torch.device("cpu")
+        return torch.device(device)
+
+    def _move_block_to_device(
+        self,
+        block: nn.Module,
+        device: Union[str, torch.device],
+        non_blocking: bool = False,
+        pin_memory: bool = False,
+    ) -> None:
+        target_device = self._normalize_device(device)
+        current_device = getattr(block, "_hy_device", None)
+        if current_device == target_device:
+            return
+
+        non_blocking = bool(non_blocking and target_device.type == "cuda")
+        pin_memory = bool(pin_memory and target_device.type == "cpu")
+
+        with torch.no_grad():
+            for param in block.parameters():
+                data = param.data.to(target_device, non_blocking=non_blocking)
+                if pin_memory:
+                    data = data.pin_memory()
+                param.data = data
+            for buffer in block.buffers():
+                if buffer is None or not torch.is_tensor(buffer):
+                    continue
+                data = buffer.data.to(target_device, non_blocking=non_blocking)
+                if pin_memory:
+                    data = data.pin_memory()
+                buffer.data = data
+
+        block._hy_device = target_device
+
+    def _move_block_to_cpu(self, block: nn.Module) -> None:
+        self._move_block_to_device(
+            block,
+            torch.device("cpu"),
+            non_blocking=False,
+            pin_memory=self.prefetch_offload,
+        )
+
+    def _find_next_offload_index(self, start_idx: int) -> Optional[int]:
+        total_blocks = len(self.double_blocks) + len(self.single_blocks)
+        for idx in range(start_idx, total_blocks):
+            if idx in self.offload_blocks:
+                return idx
+        return None
+
+    def _get_block_by_global_index(self, global_idx: int) -> nn.Module:
+        if global_idx < len(self.double_blocks):
+            return self.double_blocks[global_idx]
+        single_idx = global_idx - len(self.double_blocks)
+        if single_idx < 0 or single_idx >= len(self.single_blocks):
+            raise IndexError(f"Invalid block index: {global_idx}")
+        return self.single_blocks[single_idx]
 
     def forward(
         self,
@@ -658,10 +833,32 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
+        prefetch_enabled = (
+            self.layer_offload
+            and self.prefetch_offload
+            and img.device.type == "cuda"
+        )
+        device_index = (
+            img.device.index
+            if img.device.type == "cuda" and img.device.index is not None
+            else (torch.cuda.current_device() if prefetch_enabled else None)
+        )
+        prefetch_stream = (
+            torch.cuda.Stream(device=device_index) if prefetch_enabled else None
+        )
+        pending_prefetch: Optional[Tuple[int, nn.Module]] = None
+
         for idx, block in enumerate(self.double_blocks):
+            global_idx = idx
+            should_offload = self.layer_offload and global_idx in self.offload_blocks
+
             # Layer offloading: move block to GPU before forward pass
-            if self.layer_offload and idx in self.offload_blocks:
-                block.to(img.device)
+            if should_offload:
+                if prefetch_enabled and pending_prefetch and pending_prefetch[0] == global_idx:
+                    torch.cuda.current_stream(device=device_index).wait_stream(prefetch_stream)
+                    pending_prefetch = None
+                elif getattr(block, "_hy_device", None) != img.device:
+                    self._move_block_to_device(block, img.device)
 
             double_block_args = [
                 img,
@@ -677,9 +874,25 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             img, txt = block(*double_block_args)
 
             # Layer offloading: move block back to CPU after forward pass
-            if self.layer_offload and idx in self.offload_blocks:
-                block.to('cpu')
-                torch.cuda.empty_cache()
+            if should_offload:
+                if prefetch_enabled:
+                    next_idx = self._find_next_offload_index(global_idx + 1)
+                    if next_idx is not None:
+                        next_block = self._get_block_by_global_index(next_idx)
+                        if getattr(next_block, "_hy_device", None) != img.device:
+                            with torch.cuda.stream(prefetch_stream):
+                                self._move_block_to_device(
+                                    next_block, img.device, non_blocking=True
+                                )
+                            pending_prefetch = (next_idx, next_block)
+                        else:
+                            pending_prefetch = None
+                    else:
+                        pending_prefetch = None
+
+                self._move_block_to_cpu(block)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
@@ -687,8 +900,14 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             for idx, block in enumerate(self.single_blocks):
                 # Layer offloading for single blocks (offset by double blocks count)
                 single_idx = len(self.double_blocks) + idx
-                if self.layer_offload and single_idx in self.offload_blocks:
-                    block.to(x.device)
+                should_offload = self.layer_offload and single_idx in self.offload_blocks
+
+                if should_offload:
+                    if prefetch_enabled and pending_prefetch and pending_prefetch[0] == single_idx:
+                        torch.cuda.current_stream(device=device_index).wait_stream(prefetch_stream)
+                        pending_prefetch = None
+                    elif getattr(block, "_hy_device", None) != x.device:
+                        self._move_block_to_device(block, x.device)
 
                 single_block_args = [
                     x,
@@ -704,9 +923,25 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 x = block(*single_block_args)
 
                 # Layer offloading: move block back to CPU after forward pass
-                if self.layer_offload and single_idx in self.offload_blocks:
-                    block.to('cpu')
-                    torch.cuda.empty_cache()
+                if should_offload:
+                    if prefetch_enabled:
+                        next_idx = self._find_next_offload_index(single_idx + 1)
+                        if next_idx is not None:
+                            next_block = self._get_block_by_global_index(next_idx)
+                            if getattr(next_block, "_hy_device", None) != x.device:
+                                with torch.cuda.stream(prefetch_stream):
+                                    self._move_block_to_device(
+                                        next_block, x.device, non_blocking=True
+                                    )
+                                pending_prefetch = (next_idx, next_block)
+                            else:
+                                pending_prefetch = None
+                        else:
+                            pending_prefetch = None
+
+                    self._move_block_to_cpu(block)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         img = x[:, :img_seq_len, ...]
 
@@ -735,25 +970,40 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         return imgs
 
     def params_count(self):
+        def _unique_param_sum(blocks, attr_names):
+            seen = set()
+            total = 0
+            for block in blocks:
+                block_id = id(block)
+                if block_id in seen:
+                    continue
+                seen.add(block_id)
+                for attr in attr_names:
+                    layer = getattr(block, attr, None)
+                    if layer is None:
+                        continue
+                    total += sum(p.numel() for p in layer.parameters())
+            return total
+
+        double_param_count = _unique_param_sum(
+            self.double_blocks,
+            [
+                "img_attn_qkv",
+                "img_attn_proj",
+                "img_mlp",
+                "txt_attn_qkv",
+                "txt_attn_proj",
+                "txt_mlp",
+            ],
+        )
+        single_param_count = _unique_param_sum(
+            self.single_blocks,
+            ["linear1", "linear2"],
+        )
+
         counts = {
-            "double": sum(
-                [
-                    sum(p.numel() for p in block.img_attn_qkv.parameters())
-                    + sum(p.numel() for p in block.img_attn_proj.parameters())
-                    + sum(p.numel() for p in block.img_mlp.parameters())
-                    + sum(p.numel() for p in block.txt_attn_qkv.parameters())
-                    + sum(p.numel() for p in block.txt_attn_proj.parameters())
-                    + sum(p.numel() for p in block.txt_mlp.parameters())
-                    for block in self.double_blocks
-                ]
-            ),
-            "single": sum(
-                [
-                    sum(p.numel() for p in block.linear1.parameters())
-                    + sum(p.numel() for p in block.linear2.parameters())
-                    for block in self.single_blocks
-                ]
-            ),
+            "double": double_param_count,
+            "single": single_param_count,
             "total": sum(p.numel() for p in self.parameters()),
         }
         counts["attn+mlp"] = counts["double"] + counts["single"]

@@ -186,6 +186,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self._progress_bar_config.update(progress_bar_config)
 
         self.args = args
+        self._latest_metrics = None
         # ==========================================================================================
 
         if (
@@ -955,16 +956,37 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        self._latest_metrics = None
 
-        # Metrics collection
-        import psutil
-        collect_metrics = getattr(self.args, 'collect_metrics', False)
-        metrics = {
-            'gpu_memory_peak': 0,
-            'gpu_memory_per_step': [],
-            'cpu_memory_per_step': [],
-            'step_times': []
-        }
+        cuda_device = None
+        if torch.cuda.is_available():
+            if isinstance(device, torch.device):
+                cuda_device = device if device.type == "cuda" else None
+            elif isinstance(device, str) and device.startswith("cuda"):
+                cuda_device = torch.device(device)
+
+        # Metrics collection (optional, disable gracefully if dependencies missing)
+        collect_metrics = bool(getattr(self.args, "collect_metrics", False))
+        psutil_process = None
+        metrics = None
+        if collect_metrics:
+            metrics = {
+                "gpu_memory_peak": 0.0,
+                "gpu_memory_allocated": [],
+                "cpu_memory_used": [],
+                "step_times": [],
+            }
+            if cuda_device is not None:
+                torch.cuda.reset_peak_memory_stats(cuda_device)
+
+            try:
+                import psutil  # local import; may be unavailable in minimal installs
+
+                psutil_process = psutil.Process()
+            except ImportError:
+                logger.warning(
+                    "psutil is not installed; CPU memory metrics will be skipped."
+                )
 
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1048,17 +1070,25 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     )
 
                 # Collect metrics
-                if collect_metrics:
+                if metrics is not None:
                     step_time = time.time() - step_start
-                    metrics['step_times'].append(step_time)
+                    metrics["step_times"].append(step_time)
 
-                    if torch.cuda.is_available():
-                        gpu_mem = torch.cuda.max_memory_allocated(device) / (1024**3)  # GB
-                        metrics['gpu_memory_per_step'].append(gpu_mem)
-                        metrics['gpu_memory_peak'] = max(metrics['gpu_memory_peak'], gpu_mem)
+                    if cuda_device is not None:
+                        current_allocated = (
+                            torch.cuda.memory_allocated(cuda_device) / (1024 ** 3)
+                        )
+                        metrics["gpu_memory_allocated"].append(current_allocated)
+                        peak_allocated = (
+                            torch.cuda.max_memory_allocated(cuda_device) / (1024 ** 3)
+                        )
+                        metrics["gpu_memory_peak"] = max(
+                            metrics["gpu_memory_peak"], peak_allocated
+                        )
 
-                    cpu_mem = psutil.Process().memory_info().rss / (1024**3)  # GB
-                    metrics['cpu_memory_per_step'].append(cpu_mem)
+                    if psutil_process is not None:
+                        cpu_mem = psutil_process.memory_info().rss / (1024 ** 3)
+                        metrics["cpu_memory_used"].append(cpu_mem)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
@@ -1121,19 +1151,33 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self.maybe_free_model_hooks()
 
         # Log metrics if collection is enabled
-        if collect_metrics:
+        if metrics is not None:
+            total_time = sum(metrics["step_times"]) if metrics["step_times"] else 0.0
+            avg_gpu = (
+                sum(metrics["gpu_memory_allocated"]) / len(metrics["gpu_memory_allocated"])
+                if metrics["gpu_memory_allocated"]
+                else 0.0
+            )
+            peak_cpu = max(metrics["cpu_memory_used"]) if metrics["cpu_memory_used"] else 0.0
+
             logger.info("=" * 60)
             logger.info("PERFORMANCE METRICS")
             logger.info("=" * 60)
-            logger.info(f"GPU Memory Peak: {metrics['gpu_memory_peak']:.2f} GB")
-            if len(metrics['gpu_memory_per_step']) > 0:
-                logger.info(f"GPU Memory Avg: {sum(metrics['gpu_memory_per_step'])/len(metrics['gpu_memory_per_step']):.2f} GB")
-            if len(metrics['cpu_memory_per_step']) > 0:
-                logger.info(f"CPU Memory Peak: {max(metrics['cpu_memory_per_step']):.2f} GB")
-            if len(metrics['step_times']) > 0:
-                logger.info(f"Avg Step Time: {sum(metrics['step_times'])/len(metrics['step_times']):.3f}s")
-                logger.info(f"Total Time: {sum(metrics['step_times']):.2f}s")
+            if metrics["gpu_memory_peak"] > 0:
+                logger.info(f"GPU Memory Peak: {metrics['gpu_memory_peak']:.2f} GB")
+                if avg_gpu > 0:
+                    logger.info(f"GPU Memory Avg: {avg_gpu:.2f} GB")
+            if peak_cpu > 0:
+                logger.info(f"CPU Memory Peak: {peak_cpu:.2f} GB")
+            if metrics["step_times"]:
+                logger.info(
+                    f"Avg Step Time: {total_time / len(metrics['step_times']):.3f}s"
+                )
+                logger.info(f"Total Time: {total_time:.2f}s")
             logger.info("=" * 60)
+
+            metrics["total_time"] = total_time
+            self._latest_metrics = metrics
 
         if not return_dict:
             return image
