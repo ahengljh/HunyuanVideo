@@ -1,6 +1,8 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
 
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +18,8 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+
+logger = logging.getLogger(__name__)
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -537,27 +541,14 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.int8_cache_offload = (
             bool(getattr(args, "int8_cache_offload", False)) and torch.cuda.is_available()
         )
+        quant_mode = getattr(args, "int8_quant_mode", None)
+        if quant_mode not in {"channel", "tensor"}:
+            quant_mode = "tensor" if getattr(args, "int8_per_tensor", False) else "channel"
+        self.int8_quant_mode = quant_mode
+        self.int8_per_channel = self.int8_quant_mode != "tensor"
+
         raw_offload_blocks = getattr(args, "offload_blocks", "")
-        self.offload_blocks = set()
-        if isinstance(raw_offload_blocks, str) and raw_offload_blocks.strip():
-            for token in raw_offload_blocks.split(","):
-                token = token.strip()
-                if not token:
-                    continue
-                try:
-                    self.offload_blocks.add(int(token))
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Invalid block index '{token}' received in --offload-blocks"
-                    ) from exc
-        elif isinstance(raw_offload_blocks, (list, tuple, set)):
-            for token in raw_offload_blocks:
-                try:
-                    self.offload_blocks.add(int(token))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"Invalid block index '{token}' received in --offload-blocks"
-                    ) from exc
+        self.offload_blocks = self._parse_offload_blocks(raw_offload_blocks)
 
         # Weight sharing configuration (experimental memory compression)
         total_block_count = mm_double_blocks_depth + mm_single_blocks_depth
@@ -778,6 +769,31 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+    @staticmethod
+    def _parse_offload_blocks(raw_offload_blocks: Any) -> set:
+        """Parse offload block indices from a string or iterable."""
+        offload_blocks: set = set()
+        if isinstance(raw_offload_blocks, str) and raw_offload_blocks.strip():
+            for token in raw_offload_blocks.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    offload_blocks.add(int(token))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid block index '{token}' received in --offload-blocks"
+                    ) from exc
+        elif isinstance(raw_offload_blocks, (list, tuple, set)):
+            for token in raw_offload_blocks:
+                try:
+                    offload_blocks.add(int(token))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid block index '{token}' received in --offload-blocks"
+                    ) from exc
+        return offload_blocks
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -983,11 +999,42 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             if img.device.type == "cuda" and img.device.index is not None
             else (torch.cuda.current_device() if prefetch_enabled else None)
         )
-        prefetch_stream = (
-            torch.cuda.Stream(device=device_index) if prefetch_enabled else None
-        )
+        prefetch_stream = None
+        if prefetch_enabled:
+            try:
+                prefetch_stream = torch.cuda.Stream(device=device_index)
+            except RuntimeError as exc:
+                logger.warning("Failed to create CUDA stream for prefetching: %s", exc)
+                prefetch_enabled = False
+        if prefetch_enabled and prefetch_stream is None:
+            prefetch_enabled = False
+
         pending_prefetch: Optional[Tuple[int, nn.Module]] = None
         adapter_energy: Optional[torch.Tensor] = None
+
+        if prefetch_enabled and self.offload_blocks:
+            first_offload_idx = self._find_next_offload_index(0)
+            if first_offload_idx is not None:
+                first_block = self._get_block_by_global_index(first_offload_idx)
+                if getattr(first_block, "_hy_device", None) != img.device:
+                    try:
+                        if prefetch_stream is not None:
+                            with torch.cuda.stream(prefetch_stream):
+                                self._move_block_to_device(
+                                    first_block, img.device, non_blocking=True
+                                )
+                        else:
+                            self._move_block_to_device(first_block, img.device)
+                        pending_prefetch = (first_offload_idx, first_block)
+                    except RuntimeError as exc:
+                        logger.warning(
+                            "Initial prefetch failed for block %s: %s",
+                            first_offload_idx,
+                            exc,
+                        )
+                        pending_prefetch = None
+                        prefetch_enabled = False
+                        prefetch_stream = None
 
         for idx, block in enumerate(self.double_blocks):
             global_idx = idx
@@ -995,8 +1042,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
             # Layer offloading: move block to GPU before forward pass
             if should_offload:
-                if prefetch_enabled and pending_prefetch and pending_prefetch[0] == global_idx:
-                    torch.cuda.current_stream(device=device_index).wait_stream(prefetch_stream)
+                if (
+                    prefetch_enabled
+                    and prefetch_stream is not None
+                    and pending_prefetch
+                    and pending_prefetch[0] == global_idx
+                ):
+                    torch.cuda.current_stream(device=device_index).wait_stream(
+                        prefetch_stream
+                    )
                     pending_prefetch = None
                 elif getattr(block, "_hy_device", None) != img.device:
                     self._move_block_to_device(block, img.device)
@@ -1025,7 +1079,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
             # Layer offloading: move block back to CPU after forward pass
             if should_offload:
-                if prefetch_enabled:
+                if prefetch_enabled and prefetch_stream is not None:
                     next_idx = self._find_next_offload_index(global_idx + 1)
                     if next_idx is not None:
                         next_block = self._get_block_by_global_index(next_idx)
@@ -1037,6 +1091,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                             pending_prefetch = (next_idx, next_block)
                         else:
                             pending_prefetch = None
+                    else:
+                        pending_prefetch = None
+                elif prefetch_enabled:
+                    next_idx = self._find_next_offload_index(global_idx + 1)
+                    if next_idx is not None:
+                        next_block = self._get_block_by_global_index(next_idx)
+                        if getattr(next_block, "_hy_device", None) != img.device:
+                            self._move_block_to_device(next_block, img.device)
+                        pending_prefetch = None
                     else:
                         pending_prefetch = None
 
@@ -1054,8 +1117,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 should_offload = self.layer_offload and single_idx in self.offload_blocks
 
                 if should_offload:
-                    if prefetch_enabled and pending_prefetch and pending_prefetch[0] == single_idx:
-                        torch.cuda.current_stream(device=device_index).wait_stream(prefetch_stream)
+                    if (
+                        prefetch_enabled
+                        and prefetch_stream is not None
+                        and pending_prefetch
+                        and pending_prefetch[0] == single_idx
+                    ):
+                        torch.cuda.current_stream(device=device_index).wait_stream(
+                            prefetch_stream
+                        )
                         pending_prefetch = None
                     elif getattr(block, "_hy_device", None) != x.device:
                         self._move_block_to_device(block, x.device)
@@ -1084,7 +1154,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
                 # Layer offloading: move block back to CPU after forward pass
                 if should_offload:
-                    if prefetch_enabled:
+                    if prefetch_enabled and prefetch_stream is not None:
                         next_idx = self._find_next_offload_index(single_idx + 1)
                         if next_idx is not None:
                             next_block = self._get_block_by_global_index(next_idx)
@@ -1096,6 +1166,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                                 pending_prefetch = (next_idx, next_block)
                             else:
                                 pending_prefetch = None
+                        else:
+                            pending_prefetch = None
+                    elif prefetch_enabled:
+                        next_idx = self._find_next_offload_index(single_idx + 1)
+                        if next_idx is not None:
+                            next_block = self._get_block_by_global_index(next_idx)
+                            if getattr(next_block, "_hy_device", None) != x.device:
+                                self._move_block_to_device(next_block, x.device)
+                            pending_prefetch = None
                         else:
                             pending_prefetch = None
 

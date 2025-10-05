@@ -221,6 +221,10 @@ class Inference(object):
                 "Int8 cache offload enabled for %d configured blocks",
                 len(model.offload_blocks),
             )
+            logger.info(
+                "Int8 cache quantization mode: %s",
+                getattr(model, "int8_quant_mode", "channel"),
+            )
 
         # ============================= Build extra models ========================
         # VAE

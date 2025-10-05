@@ -286,16 +286,23 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Keep int8 weight caches on GPU for offloaded blocks to reduce PCIe traffic.",
     )
     group.add_argument(
+        "--int8-quant-mode",
+        type=str,
+        default="channel",
+        choices=["channel", "tensor"],
+        help="Quantization strategy when building int8 caches (channel: per-output channel, tensor: single scale).",
+    )
+    group.add_argument(
         "--share-adapter-rank",
         type=int,
         default=0,
-        help="Low-rank adapter size applied to shared blocks (0 disables residual adapters).",
+        help="Low-rank residual adapter size applied to shared blocks (0 disables adapters).",
     )
     group.add_argument(
         "--share-adapter-scale",
         type=float,
         default=1.0,
-        help="Scaling factor for shared-block residual adapters.",
+        help="Scaling factor for residual adapters on shared blocks.",
     )
     group.add_argument(
         "--layer-share-map",
