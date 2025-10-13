@@ -136,6 +136,17 @@ def parse_offload_plan(
             )
         stage_name, spec_body = segment.split(":", 1)
         stage_name = stage_name.strip().lower()
+
+        if stage_name in {"auto", "all"}:
+            ratio_override = coerce_ratio(
+                float_or_none(spec_body.strip()) if spec_body.strip() else default_ratio,
+                0.5,
+            )
+            for stage_key, count in stage_to_tokens.items():
+                plan[stage_key] = pick_tail_indices(count, ratio_override)
+                filled.add(stage_key)
+            continue
+
         if stage_name not in stage_to_tokens:
             raise ValueError(
                 f"Unknown offload stage '{stage_name}'. Expected 'double' or 'single'."
@@ -207,4 +218,3 @@ def float_or_none(text: str) -> Optional[float]:
         return float(text)
     except (TypeError, ValueError):
         return None
-
