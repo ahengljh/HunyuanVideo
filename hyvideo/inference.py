@@ -487,7 +487,7 @@ class HunyuanVideoSampler(Inference):
                         pipeline.scheduler.to(device)
                     except Exception:
                         pass
-                pipeline._execution_device = device
+                object.__setattr__(pipeline, "_execution_device", device)
             else:
                 pipeline = pipeline.to(device)
 

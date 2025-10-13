@@ -253,7 +253,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             device=device,
             logger_instance=logger,
         )
-        self._execution_device = device
+        object.__setattr__(self, "_execution_device", device)
 
     def encode_prompt(
         self,
