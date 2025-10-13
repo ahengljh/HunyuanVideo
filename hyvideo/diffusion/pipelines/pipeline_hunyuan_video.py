@@ -244,6 +244,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if self.rabbit_runtime is not None:
                 self.transformer.disable_rabbit_runtime()
             self.rabbit_runtime = None
+            object.__setattr__(self, "_rabbit_device", None)
             return
 
         device = torch.device(device)
@@ -253,7 +254,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             device=device,
             logger_instance=logger,
         )
-        object.__setattr__(self, "_execution_device", device)
+        object.__setattr__(self, "_rabbit_device", device)
 
     def encode_prompt(
         self,
@@ -855,11 +856,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = (
-            torch.device(f"cuda:{dist.get_rank()}")
-            if dist.is_initialized()
-            else self._execution_device
-        )
+        if dist.is_initialized():
+            device = torch.device(f"cuda:{dist.get_rank()}")
+        else:
+            override_device = getattr(self, "_rabbit_device", None)
+            device = override_device or self._execution_device
+            device = torch.device(device)
         rabbit_runtime = self.rabbit_runtime
 
         # 3. Encode input prompt
