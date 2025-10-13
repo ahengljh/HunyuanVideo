@@ -47,6 +47,7 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
+from ...rabbit import RabbitRuntimeManager, RabbitRuntimeConfig
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -186,6 +187,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self._progress_bar_config.update(progress_bar_config)
 
         self.args = args
+        self.rabbit_runtime: Optional[RabbitRuntimeManager] = None
         # ==========================================================================================
 
         if (
@@ -234,6 +236,24 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+    def enable_rabbit_runtime(
+        self, config: RabbitRuntimeConfig, device: torch.device
+    ) -> None:
+        if not config.enabled:
+            if self.rabbit_runtime is not None:
+                self.transformer.disable_rabbit_runtime()
+            self.rabbit_runtime = None
+            return
+
+        device = torch.device(device)
+        self.rabbit_runtime = RabbitRuntimeManager(
+            transformer=self.transformer,
+            config=config,
+            device=device,
+            logger_instance=logger,
+        )
+        self._execution_device = device
 
     def encode_prompt(
         self,
@@ -835,7 +855,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        device = (
+            torch.device(f"cuda:{dist.get_rank()}")
+            if dist.is_initialized()
+            else self._execution_device
+        )
+        rabbit_runtime = self.rabbit_runtime
 
         # 3. Encode input prompt
         lora_scale = (
@@ -936,6 +961,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             generator,
             latents,
         )
+        if rabbit_runtime is not None:
+            latents = rabbit_runtime.register_latents(latents)
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -961,6 +988,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                if rabbit_runtime is not None:
+                    rabbit_runtime.update_step(i, t, len(timesteps))
+                    latents = rabbit_runtime.latents_to_device(latents)
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1044,6 +1075,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
+                if rabbit_runtime is not None:
+                    latents = rabbit_runtime.after_step(latents)
+
+        if rabbit_runtime is not None:
+            latents = rabbit_runtime.latents_to_device(latents)
+
         if not output_type == "latent":
             expand_temporal_dim = False
             if len(latents.shape) == 4:
@@ -1090,6 +1127,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().float()
+
+        if rabbit_runtime is not None:
+            rabbit_runtime.finalize()
 
         # Offload all models
         self.maybe_free_model_hooks()

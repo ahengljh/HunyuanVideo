@@ -1,4 +1,4 @@
-from typing import Any, List, Tuple, Optional, Union, Dict
+from typing import Any, List, Tuple, Optional, Union, Dict, TYPE_CHECKING
 from einops import rearrange
 
 import torch
@@ -16,6 +16,9 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+
+if TYPE_CHECKING:
+    from ..rabbit.runtime import RabbitRuntimeManager, BlockExecutionContext
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -580,6 +583,9 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+        self._rabbit_runtime: Optional["RabbitRuntimeManager"] = None
+        self._rabbit_context: Optional["BlockExecutionContext"] = None
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -651,8 +657,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         max_seqlen_kv = max_seqlen_q
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+        runtime = self._rabbit_runtime
+
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
+        for idx, block in enumerate(self.double_blocks):
             double_block_args = [
                 img,
                 txt,
@@ -664,12 +672,35 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 freqs_cis,
             ]
 
-            img, txt = block(*double_block_args)
+            block_inputs: Tuple[torch.Tensor, torch.Tensor] = (img, txt)
+            if runtime is not None:
+                decision = runtime.before_block("double", idx, block, block_inputs)
+                if decision.skip and decision.outputs is not None:
+                    img, txt = decision.outputs  # type: ignore[misc]
+                    continue
+
+            block_outputs = block(*double_block_args)
+            if isinstance(block_outputs, tuple):
+                new_img, new_txt = block_outputs
+            else:
+                raise RuntimeError("Expected MMDoubleStreamBlock to return a tuple")
+
+            if runtime is not None:
+                processed = runtime.after_block(
+                    "double",
+                    idx,
+                    block,
+                    block_inputs,
+                    (new_img, new_txt),
+                )
+                img, txt = processed  # type: ignore[misc]
+            else:
+                img, txt = new_img, new_txt
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
         if len(self.single_blocks) > 0:
-            for _, block in enumerate(self.single_blocks):
+            for idx, block in enumerate(self.single_blocks):
                 single_block_args = [
                     x,
                     vec,
@@ -681,7 +712,33 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     (freqs_cos, freqs_sin),
                 ]
 
-                x = block(*single_block_args)
+                block_inputs_single: Tuple[torch.Tensor] = (x,)
+                if runtime is not None:
+                    decision = runtime.before_block(
+                        "single", idx, block, block_inputs_single
+                    )
+                    if decision.skip and decision.outputs is not None:
+                        (x,) = decision.outputs  # type: ignore[misc]
+                        continue
+
+                block_output = block(*single_block_args)
+                single_outputs = (
+                    block_output
+                    if isinstance(block_output, tuple)
+                    else (block_output,)
+                )
+
+                if runtime is not None:
+                    processed_single = runtime.after_block(
+                        "single",
+                        idx,
+                        block,
+                        block_inputs_single,
+                        single_outputs,
+                    )
+                    (x,) = processed_single  # type: ignore[misc]
+                else:
+                    x = single_outputs[0]
 
         img = x[:, :img_seq_len, ...]
 
@@ -693,6 +750,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             out["x"] = img
             return out
         return img
+
+    def enable_rabbit_runtime(self, runtime: Optional["RabbitRuntimeManager"]):
+        self._rabbit_runtime = runtime
+
+    def disable_rabbit_runtime(self):
+        self._rabbit_runtime = None
+        self._rabbit_context = None
+
+    def set_runtime_context(self, context: Optional["BlockExecutionContext"]):
+        self._rabbit_context = context
 
     def unpatchify(self, x, t, h, w):
         """

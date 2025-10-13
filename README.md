@@ -358,6 +358,32 @@ We list some more useful configurations for easy usage:
 |  `--use-cpu-offload`   |   False   |    Use CPU offload for the model load to save more memory, necessary for high-res video generation    |
 |     `--save-path`      | ./results |     Path to save the generated video      |
 
+### Rabbit Runtime Offloading & Skipping
+
+The repository now ships with **RabbitVideo-inspired runtime optimizations** that target low-memory devices. Enable them by adding `--rabbit-enable` to your inference command and combining the following knobs as needed:
+
+- `--rabbit-offload-mode weights` activates block-level weight streaming from CPU to GPU; tailor the blocks via `--rabbit-offload-plan` (e.g. `auto:0.5` for the last 50% of blocks) and `--rabbit-prefetch-distance` for overlapping transfers.
+- `--rabbit-latent-offload` moves denoised latents back to host memory between diffusion steps, keeping only the active step on HBM. Pair with `--rabbit-latent-offload-device` and `--rabbit-latent-no-pin-memory` for fine-grained control.
+- `--rabbit-skip-strategy ema` performs adaptive block skipping using an EMA-based importance score; adjust sensitivity with `--rabbit-skip-threshold`, `--rabbit-skip-progress-power`, and `--rabbit-skip-stage`.
+
+Example single-GPU launch on a memory-constrained card:
+
+```bash
+python3 sample_video.py \
+    --prompt "An astronaut sketching a nebula" \
+    --video-size 720 1280 \
+    --video-length 129 \
+    --infer-steps 40 \
+    --rabbit-enable \
+    --rabbit-offload-mode weights \
+    --rabbit-offload-plan auto:0.6 \
+    --rabbit-latent-offload \
+    --rabbit-skip-strategy ema \
+    --rabbit-log-stats
+```
+
+> ℹ️ Rabbit optimizations cannot be combined with `--use-cpu-offload` or FP8 conversion. Because dynamic skipping trades a little computation for throughput, you should validate quality for your workload when raising skip aggressiveness.
+
 
 
 ## 🚀 Parallel Inference on Multiple GPUs by xDiT

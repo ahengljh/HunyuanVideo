@@ -18,6 +18,7 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.modules.fp8_optimization import convert_fp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
+from hyvideo.rabbit import build_runtime_config
 
 try:
     import xfuser
@@ -177,6 +178,8 @@ class Inference(object):
         else:
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
 
         parallel_args = {"ulysses_degree": args.ulysses_degree, "ring_degree": args.ring_degree}
 
@@ -185,9 +188,23 @@ class Inference(object):
         # Disable gradient
         torch.set_grad_enabled(False)
 
+        if getattr(args, "rabbit_enable", False) and args.use_cpu_offload:
+            raise ValueError(
+                "Rabbit runtime optimizations cannot be combined with accelerate's sequential CPU offload."
+            )
+
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
+        should_force_cpu = (
+            getattr(args, "rabbit_enable", False)
+            and getattr(args, "rabbit_offload_mode", "none") != "none"
+        )
+
+        factor_kwargs_device = torch.device("cpu") if should_force_cpu else device
+        factor_kwargs = {
+            "device": factor_kwargs_device,
+            "dtype": PRECISION_TO_TYPE[args.precision],
+        }
         in_channels = args.latent_channels
         out_channels = args.latent_channels
 
@@ -197,9 +214,20 @@ class Inference(object):
             out_channels=out_channels,
             factor_kwargs=factor_kwargs,
         )
+
         if args.use_fp8:
-            convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
-        model = model.to(device)
+            if should_force_cpu:
+                raise ValueError(
+                    "FP8 inference is not supported when Rabbit runtime offloading is enabled."
+                )
+            convert_fp8_linear(
+                model,
+                args.dit_weight,
+                original_dtype=PRECISION_TO_TYPE[args.precision],
+            )
+
+        target_model_device = torch.device("cpu") if should_force_cpu else device
+        model = model.to(target_model_device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
 
@@ -440,10 +468,31 @@ class HunyuanVideoSampler(Inference):
             progress_bar_config=progress_bar_config,
             args=args,
         )
+
+        rabbit_config = build_runtime_config(args, model)
+
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()
         else:
-            pipeline = pipeline.to(device)
+            if rabbit_config.enabled and rabbit_config.weights_offload_enabled:
+                def move_if_exists(module: Optional[torch.nn.Module]):
+                    if module is not None:
+                        module.to(device)
+
+                move_if_exists(pipeline.text_encoder)
+                move_if_exists(pipeline.text_encoder_2)
+                move_if_exists(pipeline.vae)
+                if hasattr(pipeline.scheduler, "to"):
+                    try:
+                        pipeline.scheduler.to(device)
+                    except Exception:
+                        pass
+                pipeline._execution_device = device
+            else:
+                pipeline = pipeline.to(device)
+
+        if rabbit_config.enabled:
+            pipeline.enable_rabbit_runtime(rabbit_config, device)
 
         return pipeline
 

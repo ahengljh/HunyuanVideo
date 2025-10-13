@@ -11,6 +11,7 @@ def parse_args(namespace=None):
     parser = add_extra_models_args(parser)
     parser = add_denoise_schedule_args(parser)
     parser = add_inference_args(parser)
+    parser = add_rabbit_args(parser)
     parser = add_parallel_args(parser)
 
     args = parser.parse_args(namespace=namespace)
@@ -356,6 +357,143 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "--reproduce",
         action="store_true",
         help="Enable reproducibility by setting random seeds and deterministic algorithms.",
+    )
+
+    return parser
+
+
+def add_rabbit_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="Rabbit runtime args")
+
+    group.add_argument(
+        "--rabbit-enable",
+        action="store_true",
+        help="Enable RabbitVideo-inspired runtime optimizations (offloading, skipping).",
+    )
+    group.add_argument(
+        "--rabbit-offload-mode",
+        type=str,
+        default="none",
+        choices=["none", "weights"],
+        help="Type of weight/data offloading to apply to the DiT backbone.",
+    )
+    group.add_argument(
+        "--rabbit-offload-plan",
+        type=str,
+        default="auto",
+        help="Block selection for offloading. Examples: 'auto:0.5', 'double:10-19;single:20-39'.",
+    )
+    group.add_argument(
+        "--rabbit-offload-ratio",
+        type=float,
+        default=None,
+        help="Fallback ratio (0-1) of blocks per stage to offload when plan omits them.",
+    )
+    group.add_argument(
+        "--rabbit-offload-device",
+        type=str,
+        default="cpu",
+        help="Device used to park offloaded block weights (default: cpu).",
+    )
+    group.add_argument(
+        "--rabbit-prefetch-distance",
+        type=int,
+        default=1,
+        help="How many offloaded blocks ahead to prefetch onto GPU each step.",
+    )
+
+    group.add_argument(
+        "--rabbit-latent-offload",
+        action="store_true",
+        help="Offload denoised latents to CPU between diffusion steps to reduce HBM usage.",
+    )
+    group.add_argument(
+        "--rabbit-latent-offload-device",
+        type=str,
+        default="cpu",
+        help="Device used to stash latents when offloading between steps.",
+    )
+    group.add_argument(
+        "--rabbit-latent-pin-memory",
+        dest="rabbit_latent_pin_memory",
+        action="store_true",
+        help="Use pinned host memory when moving latents to CPU (default).",
+    )
+    group.add_argument(
+        "--rabbit-latent-no-pin-memory",
+        dest="rabbit_latent_pin_memory",
+        action="store_false",
+        help="Disable pinned host memory for latent offload transfers.",
+    )
+    group.set_defaults(rabbit_latent_pin_memory=True)
+
+    group.add_argument(
+        "--rabbit-skip-strategy",
+        type=str,
+        default="ema",
+        choices=["none", "ema", "schedule"],
+        help="Layer skipping heuristic to apply during denoising.",
+    )
+    group.add_argument(
+        "--rabbit-skip-threshold",
+        type=float,
+        default=1e-3,
+        help="Base importance threshold for skipping blocks.",
+    )
+    group.add_argument(
+        "--rabbit-skip-progress-power",
+        type=float,
+        default=2.0,
+        help="Exponent controlling how skip threshold grows with denoising progress.",
+    )
+    group.add_argument(
+        "--rabbit-skip-warmup",
+        type=int,
+        default=4,
+        help="Number of executed steps per block before skipping is considered.",
+    )
+    group.add_argument(
+        "--rabbit-skip-min-progress",
+        type=float,
+        default=0.25,
+        help="Minimum normalized progress before skipping becomes active.",
+    )
+    group.add_argument(
+        "--rabbit-skip-cooldown",
+        type=int,
+        default=1,
+        help="How many executed steps to wait after a skip before evaluating again.",
+    )
+    group.add_argument(
+        "--rabbit-skip-max-streak",
+        type=int,
+        default=4,
+        help="Maximum consecutive skips allowed for a block before forcing execution.",
+    )
+    group.add_argument(
+        "--rabbit-skip-ema-decay",
+        type=float,
+        default=0.9,
+        help="EMA decay factor for block importance tracking.",
+    )
+    group.add_argument(
+        "--rabbit-skip-stage",
+        type=str,
+        default="both",
+        choices=["both", "double", "single"],
+        help="Limit skipping to a specific stage of the transformer.",
+    )
+
+    group.add_argument(
+        "--rabbit-log-stats",
+        action="store_true",
+        help="Log a summary of offloading/skipping statistics after inference.",
+    )
+    group.add_argument(
+        "--rabbit-diagnostics-interval",
+        type=int,
+        default=5,
+        help="Reserved for future use: interval (in steps) for verbose diagnostics.",
     )
 
     return parser
