@@ -401,6 +401,56 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         default=1,
         help="How many offloaded blocks ahead to prefetch onto GPU each step.",
     )
+    group.add_argument(
+        "--rabbit-memory-budget-mb",
+        type=float,
+        default=None,
+        help="Approximate upper bound (in MB) of transformer weights that may stay on the main device. "
+        "When set, the offload planner will automatically move additional blocks to the offload device "
+        "to honor the budget.",
+    )
+    group.add_argument(
+        "--rabbit-min-device-blocks",
+        type=int,
+        default=2,
+        help="Minimum number of blocks per stage that must remain on the main device when budgeting.",
+    )
+    group.add_argument(
+        "--rabbit-cache-outputs",
+        action="store_true",
+        help="Enable block output caching so low-variance blocks can reuse features across steps.",
+    )
+    group.add_argument(
+        "--rabbit-cache-device",
+        type=str,
+        default="cpu",
+        help="Device used to stash cached outputs (default: cpu).",
+    )
+    group.add_argument(
+        "--rabbit-cache-threshold",
+        type=float,
+        default=0.02,
+        help="Maximum normalized drift between cached and current block inputs before recomputing.",
+    )
+    group.add_argument(
+        "--rabbit-cache-max-age",
+        type=int,
+        default=6,
+        help="Maximum number of denoising steps to reuse a cached block output before forcing recompute.",
+    )
+    group.add_argument(
+        "--rabbit-cache-min-importance",
+        type=float,
+        default=5e-4,
+        help="Blocks with EMA importance below this value are treated as cache-friendly.",
+    )
+    group.add_argument(
+        "--rabbit-cache-stage",
+        type=str,
+        default="both",
+        choices=["both", "double", "single"],
+        help="Restrict caching to a specific transformer stage.",
+    )
 
     group.add_argument(
         "--rabbit-latent-offload",

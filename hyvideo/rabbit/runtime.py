@@ -42,6 +42,8 @@ class BlockState:
     skip_cooldown: int = 0
     skip_streak: int = 0
     last_delta: float = 0.0
+    cache_entry: Optional["BlockCacheEntry"] = None
+    cache_age: int = 0
 
     def register_execution(self, delta: float, decay: float):
         self.executed += 1
@@ -71,6 +73,13 @@ class BlockDecision:
     outputs: Optional[Tuple[torch.Tensor, ...]] = None
 
 
+@dataclass
+class BlockCacheEntry:
+    outputs: Tuple[torch.Tensor, ...]
+    signature: torch.Tensor
+    step_index: int
+
+
 class RabbitRuntimeManager:
     """Runtime controller implementing RabbitVideo-inspired optimisations."""
 
@@ -88,6 +97,7 @@ class RabbitRuntimeManager:
 
         self.offload_device = torch.device(config.offload_device)
         self.latent_offload_device = torch.device(config.latent_offload_device)
+        self.cache_device = torch.device(config.cache_device)
 
         self.double_blocks = list(getattr(transformer, "double_blocks", []))
         self.single_blocks = list(getattr(transformer, "single_blocks", []))
@@ -134,11 +144,52 @@ class RabbitRuntimeManager:
             "importance": {
                 stage: [0.0 for _ in modules] for stage, modules in self._blocks.items()
             },
+            "cache_hits": {
+                stage: [0 for _ in modules] for stage, modules in self._blocks.items()
+            },
         }
 
         self._prepare_module_residency()
         self.transformer.enable_rabbit_runtime(self)
         self.active = config.enabled
+
+        if config.plan_metadata:
+            meta = config.plan_metadata
+            self.logger.info(
+                "[Rabbit] Memory-aware plan | target=%.1f MB | estimated=%.1f MB | "
+                "persistent=%.1f MB | blocks=%.1f MB | shortfall=%.1f MB",
+                meta.get("target_mb", 0.0),
+                meta.get("estimated_device_mb", 0.0),
+                meta.get("persistent_mb", 0.0),
+                meta.get("blocks_mb", 0.0),
+                meta.get("shortfall_mb", 0.0),
+            )
+
+        # Log initialization
+        if config.enabled and config.log_stats:
+            self.logger.info("=" * 60)
+            self.logger.info("[Rabbit] Runtime Initialized")
+            self.logger.info("=" * 60)
+            if config.skip_enabled:
+                self.logger.info(f"[Rabbit] Skip Strategy: {config.skip_strategy}")
+                self.logger.info(f"[Rabbit] Skip Threshold: {config.skip_threshold}")
+                self.logger.info(f"[Rabbit] Skip Stage: {config.skip_stage}")
+            if config.weights_offload_enabled:
+                self.logger.info(f"[Rabbit] Weight Offloading: {config.offload_mode}")
+                self.logger.info(f"[Rabbit] Offload Device: {config.offload_device}")
+                for stage, indices in config.offload_plan.items():
+                    if indices:
+                        self.logger.info(f"[Rabbit] Offloading {stage} blocks: {len(indices)} blocks")
+            if config.cache_enabled:
+                self.logger.info(
+                    "[Rabbit] Output caching enabled on %s blocks (device: %s, threshold=%.3g)",
+                    config.cache_stage,
+                    config.cache_device,
+                    config.cache_threshold,
+                )
+            if config.latent_offload:
+                self.logger.info(f"[Rabbit] Latent Offloading: ENABLED")
+            self.logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     # Public API used by the pipeline
@@ -187,6 +238,12 @@ class RabbitRuntimeManager:
             timestep=timestep_value,
             max_timestep=self._max_timestep,
         )
+
+        if self.config.log_stats and step_index % 5 == 0:
+            progress = max(self._current_context.step_progress, self._current_context.noise_progress)
+            self.logger.info(f"[Rabbit] Step {step_index+1}/{total_steps} - "
+                           f"Progress: {progress*100:.1f}% - Timestep: {timestep_value:.1f}")
+
         self.transformer.set_runtime_context(self._current_context)
 
     def before_block(
@@ -202,7 +259,13 @@ class RabbitRuntimeManager:
                 state = self._states[stage][index]
                 state.register_skip(self.config.skip_cooldown)
                 self.stats["skipped"][stage][index] += 1
+                if self.config.log_stats:
+                    self.logger.info(f"[Rabbit] Block SKIPPED: {stage}[{index}] - "
+                                   f"Total skips: {self.stats['skipped'][stage][index]}")
                 return BlockDecision(skip=True, outputs=outputs)
+        cached = self._try_cache_reuse(stage, index, inputs)
+        if cached is not None:
+            return BlockDecision(skip=True, outputs=cached)
 
         if self.config.weights_offload_enabled:
             self._ensure_on_device(stage, index, block)
@@ -224,8 +287,14 @@ class RabbitRuntimeManager:
         self.stats["executed"][stage][index] += 1
         self.stats["importance"][stage][index] = state.ema_importance
 
+        if self.config.log_stats and state.total_observations % 10 == 0:
+            self.logger.info(f"[Rabbit] Block EXECUTED: {stage}[{index}] - "
+                           f"delta={delta:.4e}, importance={state.ema_importance:.4e}")
+
         if self.config.weights_offload_enabled:
             self._offload_block(stage, index, block)
+        if self._stage_cache_enabled(stage):
+            self._update_cache_entry(stage, index, block_inputs=inputs, block_outputs=outputs)
 
         return outputs
 
@@ -245,20 +314,54 @@ class RabbitRuntimeManager:
                 stage: (mean(values) if values else 0.0)
                 for stage, values in self.stats["importance"].items()
             },
+            "cache_hits": {
+                stage: sum(values) for stage, values in self.stats["cache_hits"].items()
+            },
         }
 
-        parts = []
+        # Enhanced summary logging
+        self.logger.info("=" * 60)
+        self.logger.info("[Rabbit] PERFORMANCE SUMMARY")
+        self.logger.info("=" * 60)
+
+        total_blocks_exec = 0
+        total_blocks_skip = 0
+
         for stage in ("double", "single"):
             if stage not in summary["executed"]:
                 continue
             exec_count = summary["executed"][stage]
             skip_count = summary["skipped"][stage]
+            total_blocks = exec_count + skip_count
+            skip_rate = (skip_count / total_blocks * 100) if total_blocks > 0 else 0
             mean_importance = summary["mean_importance"].get(stage, 0.0)
-            parts.append(
-                f"{stage}: exec={exec_count} skip={skip_count} mean_importance={mean_importance:.4e}"
-            )
-        if parts:
-            self.logger.info("Rabbit runtime summary | %s", " | ".join(parts))
+
+            self.logger.info(f"[Rabbit] {stage.upper()} blocks:")
+            self.logger.info(f"  - Executed: {exec_count}/{total_blocks} blocks")
+            self.logger.info(f"  - Skipped:  {skip_count}/{total_blocks} blocks ({skip_rate:.1f}%)")
+            self.logger.info(f"  - Mean importance: {mean_importance:.4e}")
+            cache_hits = summary["cache_hits"].get(stage, 0)
+            if cache_hits > 0:
+                self.logger.info(f"  - Cache hits: {cache_hits}")
+
+            total_blocks_exec += exec_count
+            total_blocks_skip += skip_count
+
+        total_all = total_blocks_exec + total_blocks_skip
+        if total_all > 0:
+            overall_skip_rate = total_blocks_skip / total_all * 100
+            self.logger.info("-" * 40)
+            self.logger.info(f"[Rabbit] OVERALL: {overall_skip_rate:.1f}% blocks skipped")
+            self.logger.info(f"[Rabbit] Computation saved: ~{overall_skip_rate:.1f}%")
+
+        if self.config.weights_offload_enabled:
+            self.logger.info(f"[Rabbit] Weight offloading: ENABLED (device: {self.config.offload_device})")
+        if self.config.cache_enabled:
+            self.logger.info(f"[Rabbit] Output caching: ENABLED (device: {self.config.cache_device})")
+        if self.config.latent_offload:
+            self.logger.info(f"[Rabbit] Latent offloading: ENABLED")
+
+        self.logger.info("=" * 60)
         return summary
 
     # ------------------------------------------------------------------
@@ -347,6 +450,98 @@ class RabbitRuntimeManager:
         block.to(self.offload_device, non_blocking=self.device.type == "cuda")
         self._residency[stage][index] = "offload"
 
+    def _stage_cache_enabled(self, stage: StageName) -> bool:
+        if not self.config.cache_enabled:
+            return False
+        if self.config.cache_stage == "both":
+            return True
+        return stage == self.config.cache_stage
+
+    def _build_signature(self, tensors: Tuple[torch.Tensor, ...]) -> Optional[torch.Tensor]:
+        stats: List[torch.Tensor] = []
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            flat = tensor.detach().float()
+            if flat.numel() == 0:
+                continue
+            mean_val = flat.mean()
+            std_val = flat.std(unbiased=False)
+            stats.append(torch.stack((mean_val, std_val)))
+        if not stats:
+            return None
+        stacked = torch.stack(stats).mean(dim=0)
+        return stacked.to(self.cache_device)
+
+    def _signature_drift(self, current: torch.Tensor, cached: torch.Tensor) -> float:
+        diff = torch.mean(torch.abs(current - cached))
+        norm = torch.mean(torch.abs(cached)).clamp(min=1e-6)
+        return (diff / norm).item()
+
+    def _try_cache_reuse(
+        self, stage: StageName, index: int, inputs: Tuple[torch.Tensor, ...]
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        if not self._stage_cache_enabled(stage):
+            return None
+        state = self._states[stage][index]
+        entry = state.cache_entry
+        if entry is None or self._current_context is None:
+            return None
+        age = self._current_context.step_index - entry.step_index
+        if age <= 0 or age > self.config.cache_max_age:
+            return None
+        # Inspired by ToCa (Zou et al., 2025), prefer caching for low-impact tokens/blocks only.
+        if state.ema_importance > self.config.cache_min_importance:
+            return None
+        signature = self._build_signature(inputs)
+        if signature is None:
+            return None
+        drift = self._signature_drift(signature, entry.signature)
+        if drift > self.config.cache_threshold:
+            return None
+
+        outputs = tuple(
+            tensor.to(self.device, non_blocking=self.device.type == "cuda")
+            if tensor.device != self.device
+            else tensor
+            for tensor in entry.outputs
+        )
+        self.stats["cache_hits"][stage][index] += 1
+        state.cache_age += 1
+        if self.config.log_stats:
+            self.logger.info(
+                "[Rabbit] Cache REUSE: %s[%d] age=%d drift=%.3g",
+                stage,
+                index,
+                age,
+                drift,
+            )
+        return outputs
+
+    def _update_cache_entry(
+        self,
+        stage: StageName,
+        index: int,
+        block_inputs: Tuple[torch.Tensor, ...],
+        block_outputs: Tuple[torch.Tensor, ...],
+    ):
+        # Inspired by ProfilingDiT (Ma et al., 2025) and TeaCache (Liu et al., 2025),
+        # we only cache low-variance blocks and track lightweight signatures.
+        signature = self._build_signature(block_inputs)
+        if signature is None or self._current_context is None:
+            self._states[stage][index].cache_entry = None
+            return
+        outputs = tuple(
+            tensor.detach().to(self.cache_device, non_blocking=self.device.type == "cuda")
+            for tensor in block_outputs
+        )
+        self._states[stage][index].cache_entry = BlockCacheEntry(
+            outputs=outputs,
+            signature=signature,
+            step_index=self._current_context.step_index,
+        )
+        self._states[stage][index].cache_age = 0
+
     def _compute_importance(
         self,
         stage: StageName,
@@ -367,7 +562,17 @@ class RabbitRuntimeManager:
 
     def _should_skip(self, stage: StageName, index: int) -> bool:
         state = self._states[stage][index]
-        if state.executed < self.config.skip_warmup_steps:
+
+        # Log decision process when verbose
+        if self.config.log_stats and (state.total_observations % 10 == 0 or state.executed == 0):
+            self.logger.info(f"[Rabbit] Skip check {stage}[{index}]: executed={state.executed}, "
+                           f"importance={state.ema_importance:.4e}, cooldown={state.skip_cooldown}, "
+                           f"warmup={self.config.skip_warmup_steps}")
+
+        # Need at least warmup executions before considering skipping
+        # Ensure we always execute at least once to build initial importance
+        min_executions = max(1, self.config.skip_warmup_steps)
+        if state.executed < min_executions:
             return False
         if state.skip_cooldown > 0:
             return False
@@ -383,6 +588,8 @@ class RabbitRuntimeManager:
             progress ** self.config.skip_progress_power
         )
         if state.ema_importance < threshold and state.skip_streak < self.config.skip_max_streak:
+            if self.config.log_stats:
+                self.logger.info(f"[Rabbit] SKIPPING {stage}[{index}]: importance={state.ema_importance:.4e} < "
+                               f"threshold={threshold:.4e} (progress={progress:.2f})")
             return True
         return False
-

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+import torch
 
 
 @dataclass
@@ -16,6 +18,15 @@ class RabbitRuntimeConfig:
     )
     offload_device: str = "cpu"
     prefetch_distance: int = 1
+    memory_budget_mb: Optional[float] = None
+    min_device_blocks: int = 1
+    plan_metadata: Dict[str, float] = field(default_factory=dict)
+    cache_outputs: bool = False
+    cache_device: str = "cpu"
+    cache_threshold: float = 0.02
+    cache_max_age: int = 6
+    cache_min_importance: float = 5e-4
+    cache_stage: str = "both"
 
     latent_offload: bool = False
     latent_offload_device: str = "cpu"
@@ -47,6 +58,10 @@ class RabbitRuntimeConfig:
     def skip_enabled(self) -> bool:
         return self.enabled and self.skip_strategy != "none"
 
+    @property
+    def cache_enabled(self) -> bool:
+        return self.enabled and self.cache_outputs
+
 
 def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     """Create a :class:`RabbitRuntimeConfig` from CLI args and model metadata."""
@@ -59,6 +74,19 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.offload_mode = getattr(args, "rabbit_offload_mode", "none")
     cfg.offload_device = getattr(args, "rabbit_offload_device", "cpu")
     cfg.prefetch_distance = max(0, int(getattr(args, "rabbit_prefetch_distance", 1)))
+    memory_budget = getattr(args, "rabbit_memory_budget_mb", None)
+    cfg.memory_budget_mb = (
+        float(memory_budget) if memory_budget is not None else None
+    )
+    if cfg.memory_budget_mb is not None and cfg.memory_budget_mb <= 0:
+        cfg.memory_budget_mb = None
+    cfg.min_device_blocks = max(0, int(getattr(args, "rabbit_min_device_blocks", 2)))
+    cfg.cache_outputs = bool(getattr(args, "rabbit_cache_outputs", False))
+    cfg.cache_device = getattr(args, "rabbit_cache_device", "cpu")
+    cfg.cache_threshold = float(getattr(args, "rabbit_cache_threshold", 0.02))
+    cfg.cache_max_age = max(1, int(getattr(args, "rabbit_cache_max_age", 6)))
+    cfg.cache_min_importance = float(getattr(args, "rabbit_cache_min_importance", 5e-4))
+    cfg.cache_stage = getattr(args, "rabbit_cache_stage", "both")
 
     cfg.latent_offload = bool(getattr(args, "rabbit_latent_offload", False))
     cfg.latent_offload_device = getattr(
@@ -93,6 +121,14 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
         cfg.offload_mode,
         default_ratio,
     )
+
+    if cfg.weights_offload_enabled and cfg.memory_budget_mb is not None:
+        cfg.offload_plan, cfg.plan_metadata = plan_for_memory_budget(
+            transformer=transformer,
+            budget_mb=cfg.memory_budget_mb,
+            min_blocks=cfg.min_device_blocks,
+            base_plan=cfg.offload_plan,
+        )
 
     return cfg
 
@@ -218,3 +254,102 @@ def float_or_none(text: str) -> Optional[float]:
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+BYTES_IN_MB = 1024 * 1024
+
+
+def plan_for_memory_budget(
+    transformer,
+    budget_mb: float,
+    min_blocks: int,
+    base_plan: Dict[str, List[int]],
+) -> Tuple[Dict[str, List[int]], Dict[str, float]]:
+    """Derive a block offload plan to keep on-device weights under the requested budget."""
+
+    stage_blocks = {
+        "double": list(getattr(transformer, "double_blocks", [])),
+        "single": list(getattr(transformer, "single_blocks", [])),
+    }
+    stage_sizes = {
+        stage: [module_num_bytes(block) for block in blocks]
+        for stage, blocks in stage_blocks.items()
+    }
+    persistent_attrs = [
+        "img_in",
+        "txt_in",
+        "time_in",
+        "vector_in",
+        "guidance_in",
+        "final_layer",
+    ]
+    persistent_bytes = sum(
+        module_num_bytes(getattr(transformer, attr, None)) for attr in persistent_attrs
+    )
+
+    total_block_bytes = sum(sum(sizes) for sizes in stage_sizes.values())
+    budget_bytes = budget_mb * BYTES_IN_MB
+    base_sets = {
+        stage: {idx for idx in base_plan.get(stage, []) if 0 <= idx < len(stage_blocks[stage])}
+        for stage in stage_blocks
+    }
+    base_offloaded_bytes = sum(
+        stage_sizes[stage][idx] for stage in stage_sizes for idx in base_sets[stage]
+    )
+    device_block_bytes = total_block_bytes - base_offloaded_bytes
+    target_block_budget = max(0, budget_bytes - persistent_bytes)
+    bytes_to_remove = max(device_block_bytes - target_block_budget, 0)
+    added_offloads = {stage: set() for stage in stage_blocks}
+
+    if bytes_to_remove > 0:
+        # Prefer evicting the tail of the single stream (executed last), then the double stream.
+        for stage in ("single", "double"):
+            sizes = stage_sizes[stage]
+            if not sizes:
+                continue
+            stage_min_blocks = min(min_blocks, len(sizes))
+            for idx in range(len(sizes) - 1, -1, -1):
+                if bytes_to_remove <= 0:
+                    break
+                if idx in base_sets[stage] or idx in added_offloads[stage]:
+                    continue
+                remaining_if_removed = len(sizes) - (len(base_sets[stage]) + len(added_offloads[stage]) + 1)
+                if remaining_if_removed < stage_min_blocks:
+                    continue
+                added_offloads[stage].add(idx)
+                bytes_to_remove -= sizes[idx]
+            if bytes_to_remove <= 0:
+                break
+
+    final_plan = {
+        stage: sorted(base_sets[stage].union(added_offloads[stage]))
+        for stage in stage_blocks
+    }
+    total_offloaded_bytes = sum(
+        stage_sizes[stage][idx] for stage in stage_sizes for idx in final_plan[stage]
+    )
+    remaining_block_bytes = max(total_block_bytes - total_offloaded_bytes, 0)
+    estimated_device_mb = (persistent_bytes + remaining_block_bytes) / BYTES_IN_MB
+    shortfall_mb = max(0.0, estimated_device_mb - budget_mb)
+
+    metadata = {
+        "target_mb": float(budget_mb),
+        "persistent_mb": persistent_bytes / BYTES_IN_MB,
+        "blocks_mb": total_block_bytes / BYTES_IN_MB,
+        "estimated_device_mb": estimated_device_mb,
+        "offloaded_blocks_double": float(len(final_plan["double"])),
+        "offloaded_blocks_single": float(len(final_plan["single"])),
+        "shortfall_mb": shortfall_mb,
+    }
+    return final_plan, metadata
+
+
+def module_num_bytes(module: Optional[torch.nn.Module]) -> int:
+    if module is None:
+        return 0
+    total = 0
+    for param in module.parameters(recurse=True):
+        total += param.numel() * param.element_size()
+    for buf in module.buffers(recurse=True):
+        total += buf.numel() * buf.element_size()
+    return total

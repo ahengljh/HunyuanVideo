@@ -363,6 +363,8 @@ We list some more useful configurations for easy usage:
 The repository now ships with **RabbitVideo-inspired runtime optimizations** that target low-memory devices. Enable them by adding `--rabbit-enable` to your inference command and combining the following knobs as needed:
 
 - `--rabbit-offload-mode weights` activates block-level weight streaming from CPU to GPU; tailor the blocks via `--rabbit-offload-plan` (e.g. `auto:0.5` for the last 50% of blocks) and `--rabbit-prefetch-distance` for overlapping transfers.
+- `--rabbit-memory-budget-mb 5000` limits the GPU-resident weights to ~5 GB by automatically evicting additional blocks to the offload device; combine with `--rabbit-min-device-blocks` to control how many blocks per stage stay resident.
+- `--rabbit-cache-outputs` enables Rabbit’s selective block output caching. Pair it with `--rabbit-cache-threshold`, `--rabbit-cache-max-age`, and `--rabbit-cache-stage` to reuse only the low-variance background blocks, cutting compute cost without resorting to identity skips.
 - `--rabbit-latent-offload` moves denoised latents back to host memory between diffusion steps, keeping only the active step on HBM. Pair with `--rabbit-latent-offload-device` and `--rabbit-latent-no-pin-memory` for fine-grained control.
 - `--rabbit-skip-strategy ema` performs adaptive block skipping using an EMA-based importance score; adjust sensitivity with `--rabbit-skip-threshold`, `--rabbit-skip-progress-power`, and `--rabbit-skip-stage`.
 
