@@ -494,6 +494,13 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
     group.set_defaults(rabbit_profile_cache=True, rabbit_profile_offload=True)
 
     group.add_argument(
+        "--rabbit-cfg-reuse-interval",
+        type=int,
+        default=1,
+        help="Reuse cached unconditional branch every N steps when using classifier-free guidance (>=1).",
+    )
+
+    group.add_argument(
         "--rabbit-latent-offload",
         action="store_true",
         help="Offload denoised latents to CPU between diffusion steps to reduce HBM usage.",

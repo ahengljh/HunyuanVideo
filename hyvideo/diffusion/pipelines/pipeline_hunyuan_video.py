@@ -47,7 +47,7 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
-from ...rabbit import RabbitRuntimeManager, RabbitRuntimeConfig
+# Rabbit imports - imported locally in enable_rabbit_runtime to avoid circular deps
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -187,7 +187,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self._progress_bar_config.update(progress_bar_config)
 
         self.args = args
-        self.rabbit_runtime: Optional[RabbitRuntimeManager] = None
+        self.rabbit_runtime = None  # Will be RabbitRuntimeManager if enabled
         # ==========================================================================================
 
         if (
@@ -238,7 +238,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
     def enable_rabbit_runtime(
-        self, config: RabbitRuntimeConfig, device: torch.device
+        self, config, device: torch.device
     ) -> None:
         if not config.enabled:
             if self.rabbit_runtime is not None:
@@ -246,6 +246,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             self.rabbit_runtime = None
             object.__setattr__(self, "_rabbit_device", None)
             return
+
+        # Import here to avoid circular dependencies
+        from ...rabbit.runtime import RabbitRuntimeManager
 
         device = torch.device(device)
         self.rabbit_runtime = RabbitRuntimeManager(
@@ -917,6 +920,15 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             prompt_mask_2 = None
             negative_prompt_mask_2 = None
 
+        prompt_embeds_cond = prompt_embeds
+        prompt_mask_cond = prompt_mask
+        prompt_embeds_2_cond = prompt_embeds_2
+        prompt_mask_2_cond = prompt_mask_2
+        negative_prompt_embeds_cond = negative_prompt_embeds
+        negative_prompt_mask_cond = negative_prompt_mask
+        negative_prompt_embeds_2_cond = negative_prompt_embeds_2
+        negative_prompt_mask_2_cond = negative_prompt_mask_2
+
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
@@ -987,6 +999,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            cfg_reuse_interval = max(1, int(getattr(self.args, "rabbit_cfg_reuse_interval", 1)))
+            cached_uncond: Optional[torch.Tensor] = None
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
@@ -996,11 +1010,20 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     latents = rabbit_runtime.latents_to_device(latents)
 
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2)
-                    if self.do_classifier_free_guidance
-                    else latents
+                reuse_cfg = (
+                    self.do_classifier_free_guidance
+                    and cfg_reuse_interval > 1
+                    and cached_uncond is not None
+                    and (i % cfg_reuse_interval) != 0
                 )
+                if reuse_cfg:
+                    latent_model_input = latents
+                else:
+                    latent_model_input = (
+                        torch.cat([latents] * 2)
+                        if self.do_classifier_free_guidance
+                        else latents
+                    )
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
                 )
@@ -1021,26 +1044,45 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
-                    noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                        latent_model_input,  # [2, 16, 33, 24, 42]
-                        t_expand,  # [2]
-                        text_states=prompt_embeds,  # [2, 256, 4096]
-                        text_mask=prompt_mask,  # [2, 256]
-                        text_states_2=prompt_embeds_2,  # [2, 768]
-                        freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
-                        freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
-                        guidance=guidance_expand,
-                        return_dict=True,
-                    )[
-                        "x"
-                    ]
+                    if reuse_cfg:
+                        noise_pred_cond = self.transformer(
+                            latent_model_input,
+                            t_expand,
+                            text_states=prompt_embeds_cond,
+                            text_mask=prompt_mask_cond,
+                            text_states_2=prompt_embeds_2_cond,
+                            freqs_cos=freqs_cis[0],
+                            freqs_sin=freqs_cis[1],
+                            guidance=guidance_expand,
+                            return_dict=True,
+                        )["x"]
+                    else:
+                        noise_pred = self.transformer(
+                            latent_model_input,
+                            t_expand,
+                            text_states=prompt_embeds,
+                            text_mask=prompt_mask,
+                            text_states_2=prompt_embeds_2,
+                            freqs_cos=freqs_cis[0],
+                            freqs_sin=freqs_cis[1],
+                            guidance=guidance_expand,
+                            return_dict=True,
+                        )["x"]
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    if reuse_cfg:
+                        noise_pred_uncond = cached_uncond
+                        noise_pred_text = noise_pred_cond
+                    else:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        if cfg_reuse_interval > 1:
+                            cached_uncond = noise_pred_uncond.detach()
                     noise_pred = noise_pred_uncond + self.guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
+                elif reuse_cfg:
+                    noise_pred = noise_pred_cond
 
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
