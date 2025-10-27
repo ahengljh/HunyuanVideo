@@ -531,7 +531,10 @@ class RabbitRuntimeManager:
         if signature is None:
             return None
         drift = self._signature_drift(signature, entry.signature)
-        if drift > self.config.cache_threshold:
+        threshold = self._cache_threshold()
+        if threshold is None:
+            return None
+        if drift > threshold:
             return None
 
         outputs_list: List[torch.Tensor] = []
@@ -694,6 +697,23 @@ class RabbitRuntimeManager:
         shape[1] = mask.shape[0]
         expanded = mask.view(*shape)
         return expanded
+
+    def _cache_threshold(self) -> Optional[float]:
+        if self._current_context is None:
+            return self.config.cache_threshold
+        if (
+            self._current_context.step_index + 1
+            <= self.config.cache_warmup_steps
+        ):
+            return None
+        progress = max(
+            self._current_context.step_progress,
+            self._current_context.noise_progress,
+        )
+        if progress < self.config.cache_min_progress:
+            return None
+        scaled = progress ** max(self.config.cache_progress_power, 0.0)
+        return self.config.cache_threshold * scaled
 
     def _compute_importance(
         self,

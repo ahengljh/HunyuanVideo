@@ -458,6 +458,24 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Fraction (0-1) of tokens to keep when storing cached outputs. Remaining tokens fall back to identity on reuse.",
     )
     group.add_argument(
+        "--rabbit-cache-warmup-steps",
+        type=int,
+        default=0,
+        help="Number of initial diffusion steps to bypass cache reuse (TeaCache-inspired warmup).",
+    )
+    group.add_argument(
+        "--rabbit-cache-min-progress",
+        type=float,
+        default=0.0,
+        help="Minimum step/noise progress before cache reuse is considered (0-1).",
+    )
+    group.add_argument(
+        "--rabbit-cache-progress-power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to normalized progress when scaling the cache threshold.",
+    )
+    group.add_argument(
         "--rabbit-profile-steps",
         type=int,
         default=0,

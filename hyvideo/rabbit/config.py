@@ -28,6 +28,9 @@ class RabbitRuntimeConfig:
     cache_min_importance: float = 5e-4
     cache_stage: str = "both"
     cache_token_ratio: float = 1.0
+    cache_warmup_steps: int = 0
+    cache_min_progress: float = 0.0
+    cache_progress_power: float = 1.0
     profile_steps: int = 0
     profile_low_ratio: float = 0.5
     profile_cache: bool = True
@@ -95,6 +98,9 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.cache_token_ratio = coerce_ratio(
         getattr(args, "rabbit_cache_token_ratio", 1.0), 1.0
     )
+    cfg.cache_warmup_steps = max(0, int(getattr(args, "rabbit_cache_warmup_steps", 0)))
+    cfg.cache_min_progress = max(0.0, min(1.0, float(getattr(args, "rabbit_cache_min_progress", 0.0))))
+    cfg.cache_progress_power = float(getattr(args, "rabbit_cache_progress_power", 1.0))
     cfg.profile_steps = max(0, int(getattr(args, "rabbit_profile_steps", 0)))
     cfg.profile_low_ratio = coerce_ratio(
         getattr(args, "rabbit_profile_low_ratio", 0.5), 0.5
