@@ -78,6 +78,7 @@ class BlockCacheEntry:
     outputs: Tuple[torch.Tensor, ...]
     signature: torch.Tensor
     step_index: int
+    token_masks: Optional[Tuple[Optional[torch.Tensor], ...]] = None
 
 
 class RabbitRuntimeManager:
@@ -533,12 +534,23 @@ class RabbitRuntimeManager:
         if drift > self.config.cache_threshold:
             return None
 
-        outputs = tuple(
-            tensor.to(self.device, non_blocking=self.device.type == "cuda")
-            if tensor.device != self.device
-            else tensor
-            for tensor in entry.outputs
-        )
+        outputs_list: List[torch.Tensor] = []
+        for i, tensor in enumerate(entry.outputs):
+            out_tensor = (
+                tensor.to(self.device, non_blocking=self.device.type == "cuda")
+                if tensor.device != self.device
+                else tensor.clone()
+            )
+            mask = None
+            if entry.token_masks is not None and i < len(entry.token_masks):
+                mask = entry.token_masks[i]
+            if mask is not None:
+                mask_dev = mask.to(self.device, non_blocking=self.device.type == "cuda")
+                expanded = self._expand_token_mask(mask_dev, out_tensor)
+                input_tensor = inputs[i].to(self.device)
+                out_tensor = torch.where(expanded, out_tensor, input_tensor)
+            outputs_list.append(out_tensor)
+        outputs = tuple(outputs_list)
         self.stats["cache_hits"][stage][index] += 1
         state.cache_age += 1
         if self.config.log_stats:
@@ -572,10 +584,21 @@ class RabbitRuntimeManager:
             tensor.detach().to(self.cache_device, non_blocking=self.device.type == "cuda")
             for tensor in block_outputs
         )
+        token_masks: List[Optional[torch.Tensor]] = []
+        ratio = self.config.cache_token_ratio
+        if ratio < 1.0:
+            for inp, out in zip(block_inputs, block_outputs):
+                mask = self._compute_token_mask(inp, out, ratio)
+                token_masks.append(
+                    mask.to(self.cache_device) if mask is not None else None
+                )
+        else:
+            token_masks = [None for _ in block_outputs]
         self._states[stage][index].cache_entry = BlockCacheEntry(
             outputs=outputs,
             signature=signature,
             step_index=self._current_context.step_index,
+            token_masks=tuple(token_masks),
         )
         self._states[stage][index].cache_age = 0
 
@@ -640,6 +663,37 @@ class RabbitRuntimeManager:
                     self._residency[stage][idx] = "device"
         self._offload_sets = {stage: set(plan.get(stage, set())) for stage in self._blocks.keys()}
         self._prefetched.clear()
+
+    def _compute_token_mask(
+        self, inputs: torch.Tensor, outputs: torch.Tensor, ratio: float
+    ) -> Optional[torch.Tensor]:
+        if ratio <= 0 or outputs.ndim < 3:
+            return None
+        if inputs.shape[:2] != outputs.shape[:2]:
+            return None
+        # Expect shape (B, L, ...). Compute per-token delta averaged over batch and channels.
+        deltas = (outputs - inputs).abs()
+        dims = list(range(2, deltas.ndim))
+        if dims:
+            deltas = deltas.mean(dim=dims)
+        deltas = deltas.mean(dim=0)  # average across batch
+        tokens = deltas.shape[0]
+        keep = max(0, int(round(tokens * ratio)))
+        if keep >= tokens:
+            return None
+        mask = torch.zeros(tokens, dtype=torch.bool, device=deltas.device)
+        if keep > 0:
+            _, indices = torch.topk(-deltas, k=keep, largest=False)
+            mask.scatter_(0, indices, True)
+        return mask
+
+    def _expand_token_mask(self, mask: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim < 2:
+            return mask
+        shape = [1] * tensor.ndim
+        shape[1] = mask.shape[0]
+        expanded = mask.view(*shape)
+        return expanded
 
     def _compute_importance(
         self,

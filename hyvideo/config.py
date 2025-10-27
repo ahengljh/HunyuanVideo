@@ -452,6 +452,12 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Restrict caching to a specific transformer stage.",
     )
     group.add_argument(
+        "--rabbit-cache-token-ratio",
+        type=float,
+        default=1.0,
+        help="Fraction (0-1) of tokens to keep when storing cached outputs. Remaining tokens fall back to identity on reuse.",
+    )
+    group.add_argument(
         "--rabbit-profile-steps",
         type=int,
         default=0,
