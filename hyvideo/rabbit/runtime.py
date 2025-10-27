@@ -148,6 +148,12 @@ class RabbitRuntimeManager:
                 stage: [0 for _ in modules] for stage, modules in self._blocks.items()
             },
         }
+        self._cache_whitelist: Dict[StageName, Optional[set]] = {
+            stage: None for stage in self._blocks.keys()
+        }
+        self.profiling_steps = max(0, self.config.profile_steps)
+        self.profiling_active = self.profiling_steps > 0
+        self._profile_finalized = False
 
         self._prepare_module_residency()
         self.transformer.enable_rabbit_runtime(self)
@@ -244,6 +250,13 @@ class RabbitRuntimeManager:
             self.logger.info(f"[Rabbit] Step {step_index+1}/{total_steps} - "
                            f"Progress: {progress*100:.1f}% - Timestep: {timestep_value:.1f}")
 
+        if (
+            self.profiling_active
+            and self.profiling_steps > 0
+            and step_index + 1 >= self.profiling_steps
+        ):
+            self._finalize_profile()
+
         self.transformer.set_runtime_context(self._current_context)
 
     def before_block(
@@ -253,6 +266,8 @@ class RabbitRuntimeManager:
         block: torch.nn.Module,
         inputs: Tuple[torch.Tensor, ...],
     ) -> BlockDecision:
+        if self.profiling_active:
+            return BlockDecision(skip=False)
         if self.config.skip_enabled and self.config.stage_enabled(stage):
             if self._should_skip(stage, index):
                 outputs = tuple(t for t in inputs)
@@ -368,8 +383,12 @@ class RabbitRuntimeManager:
     # Internal helpers
     # ------------------------------------------------------------------
     def _prepare_module_residency(self):
-        if not self.config.weights_offload_enabled:
+        if self.profiling_active or not self.config.weights_offload_enabled:
             self.transformer.to(self.device)
+            for stage, modules in self._blocks.items():
+                for idx, module in enumerate(modules):
+                    module.to(self.device)
+                    self._residency[stage][idx] = "device"
             return
 
         self._move_persistent_modules_to_device()
@@ -402,6 +421,8 @@ class RabbitRuntimeManager:
     def _ensure_on_device(
         self, stage: StageName, index: int, block: torch.nn.Module
     ):
+        if self.profiling_active or not self.config.weights_offload_enabled:
+            return
         residency = self._residency[stage][index]
         if residency == "device":
             return
@@ -417,7 +438,11 @@ class RabbitRuntimeManager:
         self._residency[stage][index] = "device"
 
     def _schedule_prefetch(self, stage: StageName, index: int):
-        if self._prefetch_stream is None:
+        if (
+            self._prefetch_stream is None
+            or self.profiling_active
+            or not self.config.weights_offload_enabled
+        ):
             return
         distance = self.config.prefetch_distance
         if distance <= 0:
@@ -442,6 +467,8 @@ class RabbitRuntimeManager:
     def _offload_block(
         self, stage: StageName, index: int, block: torch.nn.Module
     ):
+        if self.profiling_active:
+            return
         if index not in self._offload_sets[stage]:
             return
         residency = self._residency[stage][index]
@@ -451,7 +478,10 @@ class RabbitRuntimeManager:
         self._residency[stage][index] = "offload"
 
     def _stage_cache_enabled(self, stage: StageName) -> bool:
-        if not self.config.cache_enabled:
+        if not self.config.cache_enabled or self.profiling_active:
+            return False
+        allowlist = self._cache_whitelist.get(stage)
+        if allowlist is not None and len(allowlist) == 0:
             return False
         if self.config.cache_stage == "both":
             return True
@@ -486,6 +516,9 @@ class RabbitRuntimeManager:
         state = self._states[stage][index]
         entry = state.cache_entry
         if entry is None or self._current_context is None:
+            return None
+        allowlist = self._cache_whitelist.get(stage)
+        if allowlist is not None and index not in allowlist:
             return None
         age = self._current_context.step_index - entry.step_index
         if age <= 0 or age > self.config.cache_max_age:
@@ -531,6 +564,10 @@ class RabbitRuntimeManager:
         if signature is None or self._current_context is None:
             self._states[stage][index].cache_entry = None
             return
+        allowlist = self._cache_whitelist.get(stage)
+        if allowlist is not None and index not in allowlist:
+            self._states[stage][index].cache_entry = None
+            return
         outputs = tuple(
             tensor.detach().to(self.cache_device, non_blocking=self.device.type == "cuda")
             for tensor in block_outputs
@@ -541,6 +578,68 @@ class RabbitRuntimeManager:
             step_index=self._current_context.step_index,
         )
         self._states[stage][index].cache_age = 0
+
+    def _finalize_profile(self):
+        if self._profile_finalized or self.profiling_steps <= 0:
+            return
+        self._profile_finalized = True
+        self.profiling_active = False
+
+        low_ratio = self.config.profile_low_ratio
+        profile_sets: Dict[StageName, set] = {stage: set() for stage in self._blocks.keys()}
+
+        if low_ratio > 0:
+            for stage, states in self._states.items():
+                if not states:
+                    continue
+                ranked = sorted(
+                    enumerate(states),
+                    key=lambda item: item[1].ema_importance,
+                )
+                count = max(1, int(len(states) * low_ratio))
+                selected = {idx for idx, _ in ranked[:count]}
+                profile_sets[stage] = selected
+
+        if self.config.profile_cache:
+            for stage in self._blocks.keys():
+                self._cache_whitelist[stage] = set(profile_sets.get(stage, set()))
+
+        if self.config.profile_offload and self.config.weights_offload_enabled:
+            new_plan: Dict[StageName, set] = {}
+            for stage in self._blocks.keys():
+                base = set(self._offload_sets.get(stage, set()))
+                new_plan[stage] = base.union(profile_sets.get(stage, set()))
+            self._apply_offload_plan(new_plan)
+
+        if self.config.log_stats:
+            for stage, indices in profile_sets.items():
+                if indices:
+                    self.logger.info(
+                        "[Rabbit] Profiling selected low-importance %s blocks: %s",
+                        stage,
+                        sorted(indices),
+                    )
+            if self.config.profile_offload and self.config.weights_offload_enabled:
+                self.logger.info("[Rabbit] Profiling-adjusted offload plan applied")
+            if self.config.profile_cache:
+                self.logger.info("[Rabbit] Profiling-adjusted caching whitelist applied")
+
+    def _apply_offload_plan(self, plan: Dict[StageName, set]):
+        for stage, modules in self._blocks.items():
+            targets = set(plan.get(stage, set()))
+            for idx, module in enumerate(modules):
+                current = self._residency[stage][idx]
+                desired = "offload" if idx in targets else "device"
+                if desired == current:
+                    continue
+                if desired == "offload":
+                    module.to(self.offload_device, non_blocking=self.device.type == "cuda")
+                    self._residency[stage][idx] = "offload"
+                else:
+                    module.to(self.device, non_blocking=self.device.type == "cuda")
+                    self._residency[stage][idx] = "device"
+        self._offload_sets = {stage: set(plan.get(stage, set())) for stage in self._blocks.keys()}
+        self._prefetched.clear()
 
     def _compute_importance(
         self,

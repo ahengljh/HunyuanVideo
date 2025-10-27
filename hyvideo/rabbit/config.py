@@ -27,6 +27,10 @@ class RabbitRuntimeConfig:
     cache_max_age: int = 6
     cache_min_importance: float = 5e-4
     cache_stage: str = "both"
+    profile_steps: int = 0
+    profile_low_ratio: float = 0.5
+    profile_cache: bool = True
+    profile_offload: bool = True
 
     latent_offload: bool = False
     latent_offload_device: str = "cpu"
@@ -87,6 +91,12 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.cache_max_age = max(1, int(getattr(args, "rabbit_cache_max_age", 6)))
     cfg.cache_min_importance = float(getattr(args, "rabbit_cache_min_importance", 5e-4))
     cfg.cache_stage = getattr(args, "rabbit_cache_stage", "both")
+    cfg.profile_steps = max(0, int(getattr(args, "rabbit_profile_steps", 0)))
+    cfg.profile_low_ratio = coerce_ratio(
+        getattr(args, "rabbit_profile_low_ratio", 0.5), 0.5
+    )
+    cfg.profile_cache = bool(getattr(args, "rabbit_profile_cache", True))
+    cfg.profile_offload = bool(getattr(args, "rabbit_profile_offload", True))
 
     cfg.latent_offload = bool(getattr(args, "rabbit_latent_offload", False))
     cfg.latent_offload_device = getattr(

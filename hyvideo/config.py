@@ -451,6 +451,41 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         choices=["both", "double", "single"],
         help="Restrict caching to a specific transformer stage.",
     )
+    group.add_argument(
+        "--rabbit-profile-steps",
+        type=int,
+        default=0,
+        help="Number of initial diffusion steps to collect block statistics before enabling Rabbit optimizations.",
+    )
+    group.add_argument(
+        "--rabbit-profile-low-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction (0-1) of lowest-importance blocks per stage to target for offloading/caching after profiling.",
+    )
+    group.add_argument(
+        "--rabbit-profile-cache",
+        action="store_true",
+        help="Allow profiling to restrict block output caching to low-importance blocks (default).",
+    )
+    group.add_argument(
+        "--rabbit-profile-no-cache",
+        dest="rabbit_profile_cache",
+        action="store_false",
+        help="Disable caching restrictions derived from the profiling warmup.",
+    )
+    group.add_argument(
+        "--rabbit-profile-offload",
+        action="store_true",
+        help="Allow profiling to adjust the offload plan towards low-importance blocks (default).",
+    )
+    group.add_argument(
+        "--rabbit-profile-no-offload",
+        dest="rabbit_profile_offload",
+        action="store_false",
+        help="Keep the original offload plan even after profiling warmup.",
+    )
+    group.set_defaults(rabbit_profile_cache=True, rabbit_profile_offload=True)
 
     group.add_argument(
         "--rabbit-latent-offload",
