@@ -195,10 +195,12 @@ class Inference(object):
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        should_force_cpu = (
-            getattr(args, "rabbit_enable", False)
-            and getattr(args, "rabbit_offload_mode", "none") != "none"
-        )
+        if getattr(args, "rabbit_offload", None) is not None:
+            rabbit_offload_active = bool(args.rabbit_offload)
+        else:
+            rabbit_offload_active = getattr(args, "rabbit_offload_mode", "none") != "none"
+
+        should_force_cpu = getattr(args, "rabbit_enable", False) and rabbit_offload_active
 
         factor_kwargs_device = torch.device("cpu") if should_force_cpu else device
         factor_kwargs = {

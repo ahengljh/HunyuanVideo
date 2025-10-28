@@ -19,7 +19,7 @@ class RabbitRuntimeConfig:
     offload_device: str = "cpu"
     prefetch_distance: int = 1
     memory_budget_mb: Optional[float] = None
-    min_device_blocks: int = 1
+    min_device_blocks: int = 2
     plan_metadata: Dict[str, float] = field(default_factory=dict)
     cache_outputs: bool = False
     cache_device: str = "cpu"
@@ -79,62 +79,41 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     if not cfg.enabled:
         return cfg
 
-    cfg.offload_mode = getattr(args, "rabbit_offload_mode", "none")
-    cfg.offload_device = getattr(args, "rabbit_offload_device", "cpu")
-    cfg.prefetch_distance = max(0, int(getattr(args, "rabbit_prefetch_distance", 1)))
+    offload_flag = getattr(args, "rabbit_offload", None)
+    if offload_flag is None:
+        cfg.offload_mode = getattr(args, "rabbit_offload_mode", "none")
+    else:
+        cfg.offload_mode = "weights" if offload_flag else "none"
+
+    cfg.offload_device = getattr(args, "rabbit_offload_device", cfg.offload_device)
+    cfg.prefetch_distance = max(0, int(getattr(args, "rabbit_prefetch_distance", cfg.prefetch_distance)))
     memory_budget = getattr(args, "rabbit_memory_budget_mb", None)
     cfg.memory_budget_mb = (
         float(memory_budget) if memory_budget is not None else None
     )
     if cfg.memory_budget_mb is not None and cfg.memory_budget_mb <= 0:
         cfg.memory_budget_mb = None
-    cfg.min_device_blocks = max(0, int(getattr(args, "rabbit_min_device_blocks", 2)))
     cfg.cache_outputs = bool(getattr(args, "rabbit_cache_outputs", False))
-    cfg.cache_device = getattr(args, "rabbit_cache_device", "cpu")
-    cfg.cache_threshold = float(getattr(args, "rabbit_cache_threshold", 0.02))
-    cfg.cache_max_age = max(1, int(getattr(args, "rabbit_cache_max_age", 6)))
-    cfg.cache_min_importance = float(getattr(args, "rabbit_cache_min_importance", 5e-4))
-    cfg.cache_stage = getattr(args, "rabbit_cache_stage", "both")
+    cfg.cache_device = "cpu"
+    cfg.cache_threshold = float(getattr(args, "rabbit_cache_threshold", cfg.cache_threshold))
+    cfg.cache_max_age = max(1, int(getattr(args, "rabbit_cache_max_age", cfg.cache_max_age)))
+    cfg.cache_min_importance = float(getattr(args, "rabbit_cache_min_importance", cfg.cache_min_importance))
+    cfg.cache_stage = "both"
     cfg.cache_token_ratio = coerce_ratio(
-        getattr(args, "rabbit_cache_token_ratio", 1.0), 1.0
+        getattr(args, "rabbit_cache_token_ratio", cfg.cache_token_ratio), cfg.cache_token_ratio
     )
-    cfg.cache_warmup_steps = max(0, int(getattr(args, "rabbit_cache_warmup_steps", 0)))
-    cfg.cache_min_progress = max(0.0, min(1.0, float(getattr(args, "rabbit_cache_min_progress", 0.0))))
-    cfg.cache_progress_power = float(getattr(args, "rabbit_cache_progress_power", 1.0))
-    cfg.profile_steps = max(0, int(getattr(args, "rabbit_profile_steps", 0)))
-    cfg.profile_low_ratio = coerce_ratio(
-        getattr(args, "rabbit_profile_low_ratio", 0.5), 0.5
-    )
-    cfg.profile_cache = bool(getattr(args, "rabbit_profile_cache", True))
-    cfg.profile_offload = bool(getattr(args, "rabbit_profile_offload", True))
+    cfg.cache_warmup_steps = max(0, int(getattr(args, "rabbit_cache_warmup_steps", cfg.cache_warmup_steps)))
+    # Cache gating uses baked-in defaults today; expose fewer knobs on CLI.
+    cfg.profile_steps = max(0, int(getattr(args, "rabbit_profile_steps", cfg.profile_steps)))
 
     cfg.latent_offload = bool(getattr(args, "rabbit_latent_offload", False))
-    cfg.latent_offload_device = getattr(
-        args, "rabbit_latent_offload_device", "cpu"
-    )
-    cfg.latent_pin_memory = bool(
-        getattr(args, "rabbit_latent_pin_memory", True)
-    )
 
-    cfg.skip_strategy = getattr(args, "rabbit_skip_strategy", "none")
-    cfg.skip_threshold = float(getattr(args, "rabbit_skip_threshold", 1e-3))
-    cfg.skip_progress_power = float(
-        getattr(args, "rabbit_skip_progress_power", 2.0)
-    )
-    cfg.skip_warmup_steps = max(0, int(getattr(args, "rabbit_skip_warmup", 4)))
-    cfg.skip_min_progress = float(getattr(args, "rabbit_skip_min_progress", 0.2))
-    cfg.skip_cooldown = max(0, int(getattr(args, "rabbit_skip_cooldown", 1)))
-    cfg.skip_max_streak = max(1, int(getattr(args, "rabbit_skip_max_streak", 4)))
-    cfg.skip_ema_decay = float(getattr(args, "rabbit_skip_ema_decay", 0.9))
-    cfg.skip_stage = getattr(args, "rabbit_skip_stage", "both")
+    cfg.skip_strategy = "none"
 
     cfg.log_stats = bool(getattr(args, "rabbit_log_stats", False))
-    cfg.diagnostics_interval = max(
-        1, int(getattr(args, "rabbit_diagnostics_interval", 5))
-    )
 
-    plan_str = getattr(args, "rabbit_offload_plan", "auto")
-    default_ratio = getattr(args, "rabbit_offload_ratio", None)
+    plan_str = "auto"
+    default_ratio = 0.5
     cfg.offload_plan = parse_offload_plan(
         plan_str,
         transformer,

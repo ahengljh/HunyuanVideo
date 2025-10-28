@@ -1,6 +1,8 @@
 import os
 import time
 from pathlib import Path
+
+import torch
 from loguru import logger
 from datetime import datetime
 
@@ -12,6 +14,21 @@ from hyvideo.inference import HunyuanVideoSampler
 def main():
     args = parse_args()
     print(args)
+    if getattr(args, "max_memory_fraction", None) is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_per_process_memory_fraction(
+                float(args.max_memory_fraction),
+                device=torch.cuda.current_device(),
+            )
+            logger.info(
+                f"Restricting CUDA allocator to {args.max_memory_fraction:.3f} of device memory."
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                f"Failed to set CUDA memory fraction ({args.max_memory_fraction}): {exc}"
+            )
+    elif getattr(args, "max_memory_fraction", None) is not None:
+        logger.warning("Max memory fraction requested but CUDA is not available; ignoring.")
     models_root_path = Path(args.model_base)
     if not models_root_path.exists():
         raise ValueError(f"`models_root` not exists: {models_root_path}")

@@ -21,7 +21,7 @@ flowchart LR
 
     A -- weight prefetch --> B
     B -- stream to GPU --> A
-    A -- importance / skip stats --> E
+    A -- importance / cache stats --> E
     E -- cached outputs --> A
     A -- results --> C
     C -- offload after step --> D
@@ -29,10 +29,10 @@ flowchart LR
 ```
 
 **What happens each diffusion step**
-1. **Weight streaming** – the offload planner keeps critical blocks resident; tail blocks are prefetched from CPU (`--rabbit-offload-plan`, `--rabbit-memory-budget-mb`, `--rabbit-prefetch-distance`).
+1. **Weight streaming** – the offload planner keeps critical blocks resident; tail blocks are prefetched from CPU when `--rabbit-offload` is enabled (`--rabbit-memory-budget-mb`, `--rabbit-prefetch-distance`).
 2. **Output caching** – low-EMA blocks record a (mean, std) signature of their inputs; if the drift stays below `--rabbit-cache-threshold`, the cached outputs are re-used (ProfilingDiT + TeaCache inspiration).
 3. **Latent ping-pong** – denoised latents are moved back to CPU after each step when `--rabbit-latent-offload` is set.
-4. **Adaptive skipping** – still available (`--rabbit-skip-strategy ema`), but caching usually gives higher visual fidelity than identity skips.
+4. **CFG reuse** – the unconditional branch is optionally recycled across steps via `--rabbit-cfg-reuse-interval` to cut duplicate compute.
 
 ---
 
@@ -41,7 +41,7 @@ flowchart LR
 | Paper | Key mechanism | Rabbit feature |
 |-------|---------------|----------------|
 | ProfilingDiT | Foreground/background profiling | `cache_min_importance`, block-level EMA gates reuse |
-| ToCa | Token-wise ratios & cache cooldown | `cache_max_age`, stage filters (`cache_stage`) |
+| ToCa | Token-wise ratios & cache cooldown | `cache_max_age`, `cache_token_ratio` |
 | FasterCache | Dynamic feature reuse across CFG | Full block output cached instead of raw inputs |
 | TeaCache | Input signature predicts drift | `(mean, std)` signature & `cache_threshold` |
 | FORA | Static interval refresh | `cache_max_age` (minimum recompute window) |
@@ -55,9 +55,9 @@ The detailed line references live in `RABBIT_RESEARCH_NOTES.md`.
 
 > *Rabbit Runtime* orchestrates three complementary mechanisms to fit large video diffusion transformers onto commodity GPUs:
 >
-> 1. **Weight locality planner** – we partition the DiT blocks into resident and streaming sets. Low-importance tail blocks are moved to host memory and prefetched with `prefetch_distance`. The planner honors a user-specified device budget (`rabbit_memory_budget_mb`) to keep overall VRAM within limits. With the ProfilingDiT-style warmup (`--rabbit-profile-steps`), we score each block’s importance first and bias the offload plan toward background-heavy layers automatically.
-> 2. **Latent ping-pong** – denoised latents are transferred back to the host after each diffusion step to free VRAM while maintaining smooth progress. Pinned memory is optional to overlap PCIe transfers.
-> 3. **Output caching** – blocks with low EMA importance capture their output tensors (both image and text streams) and a lightweight signature. When the signature drift stays below `rabbit_cache_threshold`, we re-inject the cached result instead of recomputing, avoiding quality loss that arises from identity skips. Token-level caching à la ToCa is available via `--rabbit-cache-token-ratio`, which reuses cached activations only for low-variance tokens while letting high-variance tokens fall back to the identity path. A TeaCache-style schedule (`--rabbit-cache-warmup-steps`, `--rabbit-cache-min-progress`, `--rabbit-cache-progress-power`) postpones caching early in the denoising trajectory and tightens the threshold as the process stabilizes.
+> 1. **Weight locality planner** – we partition the DiT blocks into resident and streaming sets. Low-importance tail blocks are moved to host memory and prefetched with `--rabbit-prefetch-distance`. The planner honors a user-specified device budget (`--rabbit-memory-budget-mb`) to keep overall VRAM within limits. With the ProfilingDiT-style warmup (`--rabbit-profile-steps`), we score each block’s importance first and bias the offload plan toward background-heavy layers automatically.
+> 2. **Latent ping-pong** – denoised latents are transferred back to the host after each diffusion step to free VRAM while maintaining smooth progress; pinned host memory is used by default to overlap PCIe transfers.
+> 3. **Output caching** – blocks with low EMA importance capture their output tensors (both image and text streams) and a lightweight signature. When the signature drift stays below `--rabbit-cache-threshold`, we re-inject the cached result instead of recomputing, avoiding quality loss that arises from identity skips. Token-level caching à la ToCa is available via `--rabbit-cache-token-ratio`, which reuses cached activations only for low-variance tokens while letting high-variance tokens fall back to the identity path. A TeaCache-style warmup (`--rabbit-cache-warmup-steps`) postpones caching early in the denoising trajectory, and the runtime tightens the threshold automatically as diffusion stabilizes.
 > 4. **CFG branch caching** – when classifier-free guidance is enabled, `--rabbit-cfg-reuse-interval` lets Rabbit reuse the unconditional branch across multiple timesteps (FasterCache-style) by re-evaluating only the conditional branch between refreshes.
 >
 > The runtime exposes metrics (executed vs. cached vs. skipped blocks, cache hit rate) so users can tune aggressiveness interactively.
@@ -91,6 +91,7 @@ Run the full evaluation for two representative prompts (one high-motion, one sta
 - Borrow ProfilingDiT’s attention heat-map sanity check: visualize which blocks remain on device vs. offload.
 - Report caching ratios per layer depth as ToCa does (already logged with `cache_hits`).
 - Present a latency breakdown similar to FasterCache (attention vs. MLP vs. rest).
+- Cap CUDA memory with `--max-memory-fraction` to emulate smaller GPUs when running the ablations on larger hardware.
 
 ---
 

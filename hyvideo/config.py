@@ -298,6 +298,12 @@ def add_inference_args(parser: argparse.ArgumentParser):
         default=1,
         help="Number of videos to generate for each prompt.",
     )
+    group.add_argument(
+        "--max-memory-fraction",
+        type=float,
+        default=None,
+        help="Cap CUDA allocator to a fraction (0-1] of device memory to emulate smaller GPUs.",
+    )
     # ---sample size---
     group.add_argument(
         "--video-size",
@@ -368,26 +374,12 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--rabbit-enable",
         action="store_true",
-        help="Enable RabbitVideo-inspired runtime optimizations (offloading, skipping).",
+        help="Enable RabbitVideo-inspired runtime optimizations (offloading, caching, latent offload).",
     )
     group.add_argument(
-        "--rabbit-offload-mode",
-        type=str,
-        default="none",
-        choices=["none", "weights"],
-        help="Type of weight/data offloading to apply to the DiT backbone.",
-    )
-    group.add_argument(
-        "--rabbit-offload-plan",
-        type=str,
-        default="auto",
-        help="Block selection for offloading. Examples: 'auto:0.5', 'double:10-19;single:20-39'.",
-    )
-    group.add_argument(
-        "--rabbit-offload-ratio",
-        type=float,
-        default=None,
-        help="Fallback ratio (0-1) of blocks per stage to offload when plan omits them.",
+        "--rabbit-offload",
+        action="store_true",
+        help="Stream transformer block weights from host memory so the model fits tighter VRAM budgets.",
     )
     group.add_argument(
         "--rabbit-offload-device",
@@ -410,21 +402,9 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         "to honor the budget.",
     )
     group.add_argument(
-        "--rabbit-min-device-blocks",
-        type=int,
-        default=2,
-        help="Minimum number of blocks per stage that must remain on the main device when budgeting.",
-    )
-    group.add_argument(
         "--rabbit-cache-outputs",
         action="store_true",
         help="Enable block output caching so low-variance blocks can reuse features across steps.",
-    )
-    group.add_argument(
-        "--rabbit-cache-device",
-        type=str,
-        default="cpu",
-        help="Device used to stash cached outputs (default: cpu).",
     )
     group.add_argument(
         "--rabbit-cache-threshold",
@@ -445,13 +425,6 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Blocks with EMA importance below this value are treated as cache-friendly.",
     )
     group.add_argument(
-        "--rabbit-cache-stage",
-        type=str,
-        default="both",
-        choices=["both", "double", "single"],
-        help="Restrict caching to a specific transformer stage.",
-    )
-    group.add_argument(
         "--rabbit-cache-token-ratio",
         type=float,
         default=1.0,
@@ -464,53 +437,11 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Number of initial diffusion steps to bypass cache reuse (TeaCache-inspired warmup).",
     )
     group.add_argument(
-        "--rabbit-cache-min-progress",
-        type=float,
-        default=0.0,
-        help="Minimum step/noise progress before cache reuse is considered (0-1).",
-    )
-    group.add_argument(
-        "--rabbit-cache-progress-power",
-        type=float,
-        default=1.0,
-        help="Exponent applied to normalized progress when scaling the cache threshold.",
-    )
-    group.add_argument(
         "--rabbit-profile-steps",
         type=int,
         default=0,
         help="Number of initial diffusion steps to collect block statistics before enabling Rabbit optimizations.",
     )
-    group.add_argument(
-        "--rabbit-profile-low-ratio",
-        type=float,
-        default=0.5,
-        help="Fraction (0-1) of lowest-importance blocks per stage to target for offloading/caching after profiling.",
-    )
-    group.add_argument(
-        "--rabbit-profile-cache",
-        action="store_true",
-        help="Allow profiling to restrict block output caching to low-importance blocks (default).",
-    )
-    group.add_argument(
-        "--rabbit-profile-no-cache",
-        dest="rabbit_profile_cache",
-        action="store_false",
-        help="Disable caching restrictions derived from the profiling warmup.",
-    )
-    group.add_argument(
-        "--rabbit-profile-offload",
-        action="store_true",
-        help="Allow profiling to adjust the offload plan towards low-importance blocks (default).",
-    )
-    group.add_argument(
-        "--rabbit-profile-no-offload",
-        dest="rabbit_profile_offload",
-        action="store_false",
-        help="Keep the original offload plan even after profiling warmup.",
-    )
-    group.set_defaults(rabbit_profile_cache=True, rabbit_profile_offload=True)
-
     group.add_argument(
         "--rabbit-cfg-reuse-interval",
         type=int,
@@ -524,92 +455,9 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Offload denoised latents to CPU between diffusion steps to reduce HBM usage.",
     )
     group.add_argument(
-        "--rabbit-latent-offload-device",
-        type=str,
-        default="cpu",
-        help="Device used to stash latents when offloading between steps.",
-    )
-    group.add_argument(
-        "--rabbit-latent-pin-memory",
-        dest="rabbit_latent_pin_memory",
-        action="store_true",
-        help="Use pinned host memory when moving latents to CPU (default).",
-    )
-    group.add_argument(
-        "--rabbit-latent-no-pin-memory",
-        dest="rabbit_latent_pin_memory",
-        action="store_false",
-        help="Disable pinned host memory for latent offload transfers.",
-    )
-    group.set_defaults(rabbit_latent_pin_memory=True)
-
-    group.add_argument(
-        "--rabbit-skip-strategy",
-        type=str,
-        default="ema",
-        choices=["none", "ema", "schedule"],
-        help="Layer skipping heuristic to apply during denoising.",
-    )
-    group.add_argument(
-        "--rabbit-skip-threshold",
-        type=float,
-        default=1e-3,
-        help="Base importance threshold for skipping blocks.",
-    )
-    group.add_argument(
-        "--rabbit-skip-progress-power",
-        type=float,
-        default=2.0,
-        help="Exponent controlling how skip threshold grows with denoising progress.",
-    )
-    group.add_argument(
-        "--rabbit-skip-warmup",
-        type=int,
-        default=4,
-        help="Number of executed steps per block before skipping is considered.",
-    )
-    group.add_argument(
-        "--rabbit-skip-min-progress",
-        type=float,
-        default=0.25,
-        help="Minimum normalized progress before skipping becomes active.",
-    )
-    group.add_argument(
-        "--rabbit-skip-cooldown",
-        type=int,
-        default=1,
-        help="How many executed steps to wait after a skip before evaluating again.",
-    )
-    group.add_argument(
-        "--rabbit-skip-max-streak",
-        type=int,
-        default=4,
-        help="Maximum consecutive skips allowed for a block before forcing execution.",
-    )
-    group.add_argument(
-        "--rabbit-skip-ema-decay",
-        type=float,
-        default=0.9,
-        help="EMA decay factor for block importance tracking.",
-    )
-    group.add_argument(
-        "--rabbit-skip-stage",
-        type=str,
-        default="both",
-        choices=["both", "double", "single"],
-        help="Limit skipping to a specific stage of the transformer.",
-    )
-
-    group.add_argument(
         "--rabbit-log-stats",
         action="store_true",
-        help="Log a summary of offloading/skipping statistics after inference.",
-    )
-    group.add_argument(
-        "--rabbit-diagnostics-interval",
-        type=int,
-        default=5,
-        help="Reserved for future use: interval (in steps) for verbose diagnostics.",
+        help="Log a summary of offloading/caching statistics after inference.",
     )
 
     return parser

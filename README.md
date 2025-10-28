@@ -355,18 +355,18 @@ We list some more useful configurations for easy usage:
 |     `--flow-shift`     |    7.0    | Shift factor for flow matching schedulers |
 |     `--flow-reverse`   |    False  | If reverse, learning/sampling from t=1 -> t=0 |
 |        `--seed`        |     None  |   The random seed for generating video, if None, we init a random seed    |
+| `--max-memory-fraction`|    None   | Limit CUDA allocator to the given fraction (0-1] of device memory to emulate smaller GPUs |
 |  `--use-cpu-offload`   |   False   |    Use CPU offload for the model load to save more memory, necessary for high-res video generation    |
 |     `--save-path`      | ./results |     Path to save the generated video      |
 
-### Rabbit Runtime Offloading & Skipping
+### Rabbit Runtime Optimizations
 
 The repository now ships with **RabbitVideo-inspired runtime optimizations** that target low-memory devices. Enable them by adding `--rabbit-enable` to your inference command and combining the following knobs as needed:
 
-- `--rabbit-offload-mode weights` activates block-level weight streaming from CPU to GPU; tailor the blocks via `--rabbit-offload-plan` (e.g. `auto:0.5` for the last 50% of blocks) and `--rabbit-prefetch-distance` for overlapping transfers.
-- `--rabbit-memory-budget-mb 5000` limits the GPU-resident weights to ~5 GB by automatically evicting additional blocks to the offload device; combine with `--rabbit-min-device-blocks` to control how many blocks per stage stay resident.
-- `--rabbit-cache-outputs` enables Rabbit’s selective block output caching. Pair it with `--rabbit-cache-threshold`, `--rabbit-cache-max-age`, and `--rabbit-cache-stage` to reuse only the low-variance background blocks, cutting compute cost without resorting to identity skips.
-- `--rabbit-latent-offload` moves denoised latents back to host memory between diffusion steps, keeping only the active step on HBM. Pair with `--rabbit-latent-offload-device` and `--rabbit-latent-no-pin-memory` for fine-grained control.
-- `--rabbit-skip-strategy ema` performs adaptive block skipping using an EMA-based importance score; adjust sensitivity with `--rabbit-skip-threshold`, `--rabbit-skip-progress-power`, and `--rabbit-skip-stage`.
+- `--rabbit-offload` activates block-level weight streaming from CPU to GPU; combine with `--rabbit-memory-budget-mb` and `--rabbit-prefetch-distance` to stay within a target VRAM envelope.
+- `--rabbit-cache-outputs` enables Rabbit’s selective block output caching. Pair it with `--rabbit-cache-threshold`, `--rabbit-cache-max-age`, `--rabbit-cache-token-ratio`, and `--rabbit-cache-warmup-steps` to tune the hit rate vs. quality trade-off.
+- `--rabbit-latent-offload` moves denoised latents back to host memory between diffusion steps, keeping only the active step on HBM.
+- `--rabbit-cfg-reuse-interval` reuses the unconditional branch across diffusion steps when classifier-free guidance is on, reducing duplicate compute.
 
 Example single-GPU launch on a memory-constrained card:
 
@@ -377,14 +377,15 @@ python3 sample_video.py \
     --video-length 129 \
     --infer-steps 40 \
     --rabbit-enable \
-    --rabbit-offload-mode weights \
-    --rabbit-offload-plan auto:0.6 \
+    --rabbit-offload \
     --rabbit-latent-offload \
-    --rabbit-skip-strategy ema \
+    --rabbit-cache-outputs \
+    --rabbit-cache-threshold 0.02 \
+    --rabbit-cache-max-age 6 \
     --rabbit-log-stats
 ```
 
-> ℹ️ Rabbit optimizations cannot be combined with `--use-cpu-offload` or FP8 conversion. Because dynamic skipping trades a little computation for throughput, you should validate quality for your workload when raising skip aggressiveness.
+> ℹ️ Rabbit optimizations cannot be combined with `--use-cpu-offload` or FP8 conversion. When tightening cache thresholds or extending CFG reuse, validate quality for your workload.
 
 
 
