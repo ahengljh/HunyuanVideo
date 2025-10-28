@@ -71,7 +71,12 @@ if __name__ == "__main__":
     parser.add_argument("sample_video_args", nargs=argparse.REMAINDER, help="Arguments for sample_video.py")
     args = parser.parse_args()
 
-    if not args.sample_video_args:
+    # Remove the '--' separator if it exists at the beginning
+    sample_video_args = args.sample_video_args
+    if sample_video_args and sample_video_args[0] == '--':
+        sample_video_args = sample_video_args[1:]
+
+    if not sample_video_args:
         raise SystemExit("No arguments provided for sample_video.py")
 
     run_dir = Path(args.run_dir)
@@ -79,14 +84,14 @@ if __name__ == "__main__":
     log_file = run_dir / f"{args.tag}.log"
 
     metrics = run_with_metrics(
-        args.sample_video_args,
+        sample_video_args,
         log_file,
         device_index=args.gpu_index,
         interval=args.poll_interval,
     )
     metrics.update({
         "tag": args.tag,
-        "cmd": " ".join(args.sample_video_args),
+        "cmd": " ".join(sample_video_args),
     })
 
     metrics_file = run_dir / "metrics.jsonl"
