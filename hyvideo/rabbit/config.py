@@ -19,8 +19,14 @@ class RabbitRuntimeConfig:
     offload_device: str = "cpu"
     prefetch_distance: int = 1
     memory_budget_mb: Optional[float] = None
-    min_device_blocks: int = 1
+    min_device_blocks: int = 0
     plan_metadata: Dict[str, float] = field(default_factory=dict)
+    resident_plan: Dict[str, List[int]] = field(
+        default_factory=lambda: {"double": [], "single": []}
+    )
+    aggressive_offload: bool = True
+    hot_resident_limit: int = 0
+    hot_resident_threshold: int = 24
     cache_outputs: bool = False
     cache_device: str = "cpu"
     cache_threshold: float = 0.02
@@ -96,6 +102,9 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     min_device_blocks = getattr(args, "rabbit_min_device_blocks", None)
     if min_device_blocks is not None:
         cfg.min_device_blocks = max(0, int(min_device_blocks))
+    cfg.aggressive_offload = bool(getattr(args, "rabbit_aggressive_offload", cfg.aggressive_offload))
+    if cfg.aggressive_offload and cfg.prefetch_distance > 0:
+        cfg.prefetch_distance = 0
     cfg.cache_outputs = bool(getattr(args, "rabbit_cache_outputs", False))
     cfg.cache_device = "cpu"
     cfg.cache_threshold = float(getattr(args, "rabbit_cache_threshold", cfg.cache_threshold))
@@ -114,9 +123,17 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.skip_strategy = "none"
 
     cfg.log_stats = bool(getattr(args, "rabbit_log_stats", False))
+    cfg.hot_resident_limit = max(0, int(getattr(args, "rabbit_hot_resident_limit", cfg.hot_resident_limit)))
+    cfg.hot_resident_threshold = max(1, int(getattr(args, "rabbit_hot_resident_threshold", cfg.hot_resident_threshold)))
+
+    resident_str = getattr(args, "rabbit_resident_plan", None)
+    cfg.resident_plan = parse_resident_plan(resident_str, transformer)
+    if cfg.resident_plan:
+        max_resident = max(len(indices) for indices in cfg.resident_plan.values())
+        cfg.min_device_blocks = max(cfg.min_device_blocks, max_resident)
 
     plan_str = "auto"
-    default_ratio = 0.5
+    default_ratio = 1.0 if cfg.aggressive_offload else 0.5
     cfg.offload_plan = parse_offload_plan(
         plan_str,
         transformer,
@@ -125,14 +142,55 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     )
 
     if cfg.weights_offload_enabled and cfg.memory_budget_mb is not None:
+        # Ensure pinned residents never get scheduled for offload
         cfg.offload_plan, cfg.plan_metadata = plan_for_memory_budget(
             transformer=transformer,
             budget_mb=cfg.memory_budget_mb,
             min_blocks=cfg.min_device_blocks,
             base_plan=cfg.offload_plan,
+            pinned_blocks=cfg.resident_plan,
         )
 
+    # Respect resident hints by removing them from offload plan explicitly
+    for stage, pinned in cfg.resident_plan.items():
+        if not pinned:
+            continue
+        pinned_set = set(pinned)
+        cfg.offload_plan[stage] = [idx for idx in cfg.offload_plan.get(stage, []) if idx not in pinned_set]
+
+    ensure_min_resident_blocks(cfg, transformer)
+
     return cfg
+
+
+def parse_resident_plan(
+    plan_str: Optional[str],
+    transformer,
+) -> Dict[str, List[int]]:
+    plan = {"double": [], "single": []}
+    if not plan_str:
+        return plan
+    spec = plan_str.strip().lower()
+    if not spec:
+        return plan
+    segments = [segment.strip() for segment in spec.split(";") if segment.strip()]
+    stage_to_tokens = {
+        "double": len(getattr(transformer, "double_blocks", [])),
+        "single": len(getattr(transformer, "single_blocks", [])),
+    }
+    for segment in segments:
+        if ":" not in segment:
+            raise ValueError(
+                f"Invalid resident segment '{segment}'. Expected '<stage>:<indices>'."
+            )
+        stage_name, spec_body = segment.split(":", 1)
+        stage_name = stage_name.strip().lower()
+        if stage_name not in stage_to_tokens:
+            raise ValueError(
+                f"Unknown resident stage '{stage_name}'. Expected 'double' or 'single'."
+            )
+        plan[stage_name] = parse_stage_spec(spec_body.strip(), stage_to_tokens[stage_name])
+    return plan
 
 
 def parse_offload_plan(
@@ -266,6 +324,7 @@ def plan_for_memory_budget(
     budget_mb: float,
     min_blocks: int,
     base_plan: Dict[str, List[int]],
+    pinned_blocks: Optional[Dict[str, List[int]]] = None,
 ) -> Tuple[Dict[str, List[int]], Dict[str, float]]:
     """Derive a block offload plan to keep on-device weights under the requested budget."""
 
@@ -291,6 +350,10 @@ def plan_for_memory_budget(
 
     total_block_bytes = sum(sum(sizes) for sizes in stage_sizes.values())
     budget_bytes = budget_mb * BYTES_IN_MB
+    pinned_sets = {
+        stage: set((pinned_blocks or {}).get(stage, []))
+        for stage in stage_blocks
+    }
     base_sets = {
         stage: {idx for idx in base_plan.get(stage, []) if 0 <= idx < len(stage_blocks[stage])}
         for stage in stage_blocks
@@ -329,17 +392,20 @@ def plan_for_memory_budget(
             resident_after = len(stage_sizes[stage]) - (
                 len(base_sets[stage]) + len(added_offloads[stage]) + 1
             )
-            if resident_after < stage_min_blocks[stage]:
+            if idx in pinned_sets[stage]:
+                continue
+            if resident_after < max(stage_min_blocks[stage], len(pinned_sets[stage])):
                 continue
             added_offloads[stage].add(idx)
             bytes_to_remove -= size
             if bytes_to_remove <= 0:
                 break
 
-    final_plan = {
-        stage: sorted(base_sets[stage].union(added_offloads[stage]))
-        for stage in stage_blocks
-    }
+    final_plan = {}
+    for stage in stage_blocks:
+        combined = base_sets[stage].union(added_offloads[stage])
+        combined -= pinned_sets[stage]
+        final_plan[stage] = sorted(combined)
     total_offloaded_bytes = sum(
         stage_sizes[stage][idx] for stage in stage_sizes for idx in final_plan[stage]
     )
@@ -358,8 +424,44 @@ def plan_for_memory_budget(
         "resident_blocks_double": float(len(stage_blocks["double"]) - len(final_plan["double"])),
         "resident_blocks_single": float(len(stage_blocks["single"]) - len(final_plan["single"])),
         "min_device_blocks": float(min_blocks),
+        "pinned_blocks_double": float(len(pinned_sets["double"])),
+        "pinned_blocks_single": float(len(pinned_sets["single"])),
     }
     return final_plan, metadata
+
+
+def ensure_min_resident_blocks(cfg: RabbitRuntimeConfig, transformer) -> None:
+    """Ensure each stage keeps at least ``cfg.min_device_blocks`` residents."""
+
+    stage_blocks = {
+        "double": list(getattr(transformer, "double_blocks", [])),
+        "single": list(getattr(transformer, "single_blocks", [])),
+    }
+    for stage, blocks in stage_blocks.items():
+        total_blocks = len(blocks)
+        if total_blocks == 0:
+            continue
+        pinned = set(cfg.resident_plan.get(stage, []))
+        required_residents = max(cfg.min_device_blocks, len(pinned))
+        max_offload = max(0, total_blocks - required_residents)
+        current_plan = set(cfg.offload_plan.get(stage, []))
+        # Remove any pinned blocks that might have slipped in.
+        current_plan -= pinned
+        if len(current_plan) <= max_offload:
+            cfg.offload_plan[stage] = sorted(current_plan)
+            continue
+        # Keep the smallest modules resident to minimize device footprint.
+        sizes = [module_num_bytes(block) for block in blocks]
+        # Sort candidate indices by (size asc, index asc)
+        candidates = sorted(
+            ((sizes[idx], idx) for idx in current_plan),
+            key=lambda item: (item[0], item[1]),
+        )
+        while len(current_plan) > max_offload and candidates:
+            _, idx = candidates.pop(0)
+            if idx in current_plan:
+                current_plan.remove(idx)
+        cfg.offload_plan[stage] = sorted(current_plan)
 
 
 def module_num_bytes(module: Optional[torch.nn.Module]) -> int:

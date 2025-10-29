@@ -152,6 +152,12 @@ class RabbitRuntimeManager:
         self._cache_whitelist: Dict[StageName, Optional[set]] = {
             stage: None for stage in self._blocks.keys()
         }
+        self._hot_residents: Dict[StageName, set] = {
+            stage: set() for stage in self._blocks.keys()
+        }
+        self._hot_order: Dict[StageName, List[int]] = {
+            stage: [] for stage in self._blocks.keys()
+        }
         self.profiling_steps = max(0, self.config.profile_steps)
         self.profiling_active = self.profiling_steps > 0
         self._profile_finalized = False
@@ -178,6 +184,12 @@ class RabbitRuntimeManager:
                     int(meta.get("resident_blocks_single", 0)),
                     self.config.min_device_blocks,
                 )
+                if "pinned_blocks_double" in meta or "pinned_blocks_single" in meta:
+                    self.logger.info(
+                        "[Rabbit] Pinned blocks | double=%d | single=%d",
+                        int(meta.get("pinned_blocks_double", 0)),
+                        int(meta.get("pinned_blocks_single", 0)),
+                    )
 
         # Log initialization
         if config.enabled and config.log_stats:
@@ -195,6 +207,13 @@ class RabbitRuntimeManager:
                     self.logger.info(
                         f"[Rabbit] Offload Memory Budget: {config.memory_budget_mb:.1f} MB "
                         f"(min-device-blocks={config.min_device_blocks})"
+                    )
+                if config.aggressive_offload:
+                    self.logger.info("[Rabbit] Aggressive streaming: ENABLED (prefetch=0)")
+                if config.hot_resident_limit > 0:
+                    self.logger.info(
+                        f"[Rabbit] Hot resident cache: keeping up to {config.hot_resident_limit} blocks "
+                        f"after {config.hot_resident_threshold} executions"
                     )
                 self.logger.info(
                     f"[Rabbit] Prefetch Distance: {config.prefetch_distance}"
@@ -322,7 +341,9 @@ class RabbitRuntimeManager:
             self.logger.info(f"[Rabbit] Block EXECUTED: {stage}[{index}] - "
                            f"delta={delta:.4e}, importance={state.ema_importance:.4e}")
 
-        if self.config.weights_offload_enabled:
+        should_retain = self._maybe_promote_hot_block(stage, index, block)
+
+        if self.config.weights_offload_enabled and not should_retain:
             self._offload_block(stage, index, block)
         if self._stage_cache_enabled(stage):
             self._update_cache_entry(stage, index, block_inputs=inputs, block_outputs=outputs)
@@ -490,6 +511,58 @@ class RabbitRuntimeManager:
         residency = self._residency[stage][index]
         if residency == "offload":
             return
+        block.to(self.offload_device, non_blocking=self.device.type == "cuda")
+        self._residency[stage][index] = "offload"
+        if index in self._hot_residents[stage]:
+            self._hot_residents[stage].remove(index)
+            if index in self._hot_order[stage]:
+                self._hot_order[stage].remove(index)
+
+    def _maybe_promote_hot_block(
+        self, stage: StageName, index: int, block: torch.nn.Module
+    ) -> bool:
+        if index in self._hot_residents[stage]:
+            # Touch order to maintain LRU semantics.
+            if index in self._hot_order[stage]:
+                self._hot_order[stage].remove(index)
+            self._hot_order[stage].append(index)
+            return True
+
+        if (
+            not self.config.aggressive_offload
+            or self.config.hot_resident_limit <= 0
+            or not self.config.weights_offload_enabled
+        ):
+            return False
+
+        state = self._states[stage][index]
+        if state.executed < self.config.hot_resident_threshold:
+            return False
+
+        self._offload_sets[stage].discard(index)
+        self._hot_residents[stage].add(index)
+        self._hot_order[stage].append(index)
+        if self.device.type == "cuda" and self._residency[stage][index] != "device":
+            block.to(self.device, non_blocking=True)
+            self._residency[stage][index] = "device"
+
+        while len(self._hot_residents[stage]) > self.config.hot_resident_limit:
+            evict_index = self._hot_order[stage].pop(0)
+            if evict_index not in self._hot_residents[stage]:
+                continue
+            self._demote_hot_block(stage, evict_index)
+        return True
+
+    def _demote_hot_block(self, stage: StageName, index: int):
+        if index not in self._hot_residents[stage]:
+            return
+        self._hot_residents[stage].remove(index)
+        if index in self._hot_order[stage]:
+            self._hot_order[stage].remove(index)
+        self._offload_sets[stage].add(index)
+        if not self.config.weights_offload_enabled:
+            return
+        block = self._blocks[stage][index]
         block.to(self.offload_device, non_blocking=self.device.type == "cuda")
         self._residency[stage][index] = "offload"
 

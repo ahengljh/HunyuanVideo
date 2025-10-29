@@ -409,6 +409,36 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         "Use 0 to force full streaming when combined with a memory budget.",
     )
     group.add_argument(
+        "--rabbit-resident-plan",
+        type=str,
+        default=None,
+        help="Optional block list to keep resident on the main device. "
+        "Format mirrors offload plan syntax, e.g. 'double:0,1;single:0-2'.",
+    )
+    group.add_argument(
+        "--rabbit-aggressive-offload",
+        action="store_true",
+        help="When set (default), stream all transformer blocks except explicitly pinned residents.",
+    )
+    group.add_argument(
+        "--no-rabbit-aggressive-offload",
+        dest="rabbit_aggressive_offload",
+        action="store_false",
+    )
+    group.set_defaults(rabbit_aggressive_offload=True)
+    group.add_argument(
+        "--rabbit-hot-resident-limit",
+        type=int,
+        default=0,
+        help="Maximum number of frequently used blocks to keep resident automatically during aggressive streaming.",
+    )
+    group.add_argument(
+        "--rabbit-hot-resident-threshold",
+        type=int,
+        default=24,
+        help="Block execution count threshold before a block becomes a hot resident.",
+    )
+    group.add_argument(
         "--rabbit-cache-outputs",
         action="store_true",
         help="Enable block output caching so low-variance blocks can reuse features across steps.",
