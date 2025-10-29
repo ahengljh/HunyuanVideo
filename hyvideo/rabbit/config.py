@@ -19,7 +19,7 @@ class RabbitRuntimeConfig:
     offload_device: str = "cpu"
     prefetch_distance: int = 1
     memory_budget_mb: Optional[float] = None
-    min_device_blocks: int = 2
+    min_device_blocks: int = 1
     plan_metadata: Dict[str, float] = field(default_factory=dict)
     cache_outputs: bool = False
     cache_device: str = "cpu"
@@ -93,6 +93,9 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     )
     if cfg.memory_budget_mb is not None and cfg.memory_budget_mb <= 0:
         cfg.memory_budget_mb = None
+    min_device_blocks = getattr(args, "rabbit_min_device_blocks", None)
+    if min_device_blocks is not None:
+        cfg.min_device_blocks = max(0, int(min_device_blocks))
     cfg.cache_outputs = bool(getattr(args, "rabbit_cache_outputs", False))
     cfg.cache_device = "cpu"
     cfg.cache_threshold = float(getattr(args, "rabbit_cache_threshold", cfg.cache_threshold))
@@ -299,24 +302,37 @@ def plan_for_memory_budget(
     target_block_budget = max(0, budget_bytes - persistent_bytes)
     bytes_to_remove = max(device_block_bytes - target_block_budget, 0)
     added_offloads = {stage: set() for stage in stage_blocks}
+    stage_min_blocks = {
+        stage: min(min_blocks, len(stage_sizes[stage])) for stage in stage_blocks
+    }
 
     if bytes_to_remove > 0:
-        # Prefer evicting the tail of the single stream (executed last), then the double stream.
-        for stage in ("single", "double"):
-            sizes = stage_sizes[stage]
-            if not sizes:
+        # Create a global priority list that evicts the largest blocks first while respecting per-stage minima.
+        stage_priority = {"single": 1, "double": 0}
+        candidates: List[Tuple[int, str, int]] = []
+        for stage, sizes in stage_sizes.items():
+            for idx, size in enumerate(sizes):
+                if idx in base_sets[stage]:
+                    continue
+                candidates.append((size, stage, idx))
+
+        candidates.sort(
+            key=lambda item: (item[0], stage_priority.get(item[1], 0), -item[2]),
+            reverse=True,
+        )
+
+        for size, stage, idx in candidates:
+            if bytes_to_remove <= 0:
+                break
+            if idx in added_offloads[stage]:
                 continue
-            stage_min_blocks = min(min_blocks, len(sizes))
-            for idx in range(len(sizes) - 1, -1, -1):
-                if bytes_to_remove <= 0:
-                    break
-                if idx in base_sets[stage] or idx in added_offloads[stage]:
-                    continue
-                remaining_if_removed = len(sizes) - (len(base_sets[stage]) + len(added_offloads[stage]) + 1)
-                if remaining_if_removed < stage_min_blocks:
-                    continue
-                added_offloads[stage].add(idx)
-                bytes_to_remove -= sizes[idx]
+            resident_after = len(stage_sizes[stage]) - (
+                len(base_sets[stage]) + len(added_offloads[stage]) + 1
+            )
+            if resident_after < stage_min_blocks[stage]:
+                continue
+            added_offloads[stage].add(idx)
+            bytes_to_remove -= size
             if bytes_to_remove <= 0:
                 break
 
@@ -339,6 +355,9 @@ def plan_for_memory_budget(
         "offloaded_blocks_double": float(len(final_plan["double"])),
         "offloaded_blocks_single": float(len(final_plan["single"])),
         "shortfall_mb": shortfall_mb,
+        "resident_blocks_double": float(len(stage_blocks["double"]) - len(final_plan["double"])),
+        "resident_blocks_single": float(len(stage_blocks["single"]) - len(final_plan["single"])),
+        "min_device_blocks": float(min_blocks),
     }
     return final_plan, metadata
 

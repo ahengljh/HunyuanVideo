@@ -171,6 +171,13 @@ class RabbitRuntimeManager:
                 meta.get("blocks_mb", 0.0),
                 meta.get("shortfall_mb", 0.0),
             )
+            if "resident_blocks_double" in meta or "resident_blocks_single" in meta:
+                self.logger.info(
+                    "[Rabbit] Resident blocks | double=%d | single=%d | min-per-stage=%d",
+                    int(meta.get("resident_blocks_double", 0)),
+                    int(meta.get("resident_blocks_single", 0)),
+                    self.config.min_device_blocks,
+                )
 
         # Log initialization
         if config.enabled and config.log_stats:
@@ -184,6 +191,14 @@ class RabbitRuntimeManager:
             if config.weights_offload_enabled:
                 self.logger.info(f"[Rabbit] Weight Offloading: {config.offload_mode}")
                 self.logger.info(f"[Rabbit] Offload Device: {config.offload_device}")
+                if config.memory_budget_mb is not None:
+                    self.logger.info(
+                        f"[Rabbit] Offload Memory Budget: {config.memory_budget_mb:.1f} MB "
+                        f"(min-device-blocks={config.min_device_blocks})"
+                    )
+                self.logger.info(
+                    f"[Rabbit] Prefetch Distance: {config.prefetch_distance}"
+                )
                 for stage, indices in config.offload_plan.items():
                     if indices:
                         self.logger.info(f"[Rabbit] Offloading {stage} blocks: {len(indices)} blocks")

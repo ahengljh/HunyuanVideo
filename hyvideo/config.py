@@ -402,6 +402,13 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         "to honor the budget.",
     )
     group.add_argument(
+        "--rabbit-min-device-blocks",
+        type=int,
+        default=None,
+        help="Minimum number of transformer blocks per stage that must remain resident on the main device. "
+        "Use 0 to force full streaming when combined with a memory budget.",
+    )
+    group.add_argument(
         "--rabbit-cache-outputs",
         action="store_true",
         help="Enable block output caching so low-variance blocks can reuse features across steps.",
