@@ -445,6 +445,34 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Log a summary of offloading/caching statistics after inference.",
     )
 
+    # Frame caching arguments for small device optimization
+    group.add_argument(
+        "--rabbit-enable-cache",
+        action="store_true",
+        default=True,
+        help="Enable frame similarity caching to reuse computations (default: enabled).",
+    )
+    group.add_argument(
+        "--no-rabbit-enable-cache",
+        dest="rabbit_enable_cache",
+        action="store_false",
+        help="Disable frame caching.",
+    )
+    group.set_defaults(rabbit_enable_cache=True)
+
+    group.add_argument(
+        "--rabbit-cache-threshold",
+        type=float,
+        default=0.95,
+        help="Cosine similarity threshold for cache hits (default: 0.95, lower = more aggressive).",
+    )
+    group.add_argument(
+        "--rabbit-memory-safety",
+        type=float,
+        default=0.15,
+        help="Memory safety margin for small devices (default: 0.15 = 15%% buffer).",
+    )
+
     return parser
 
 

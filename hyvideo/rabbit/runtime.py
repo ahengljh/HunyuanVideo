@@ -5,9 +5,11 @@ import logging
 from pathlib import Path
 from dataclasses import dataclass, field
 from statistics import mean
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
+from collections import deque
 
 import torch
+import torch.nn.functional as F
 
 from .config import RabbitRuntimeConfig
 
@@ -73,6 +75,24 @@ class BlockDecision:
     outputs: Optional[Tuple[torch.Tensor, ...]] = None
 
 
+@dataclass
+class CacheEntry:
+    """Cache entry for block outputs with similarity checking."""
+    input_hash: torch.Tensor  # Small hash of input for fast comparison
+    outputs: Tuple[torch.Tensor, ...]
+    step_index: int
+    hits: int = 0
+
+    def check_similarity(self, other_hash: torch.Tensor, threshold: float = 0.95) -> bool:
+        """Check if input is similar enough to use cached output."""
+        with torch.no_grad():
+            similarity = F.cosine_similarity(
+                self.input_hash.flatten().float().unsqueeze(0),
+                other_hash.flatten().float().unsqueeze(0)
+            ).item()
+            return similarity >= threshold
+
+
 class RabbitRuntimeManager:
     """Runtime controller implementing RabbitVideo-inspired optimisations."""
 
@@ -89,6 +109,20 @@ class RabbitRuntimeManager:
         self.logger = logger_instance or logger
 
         self.offload_device = torch.device(config.offload_device)
+
+        # Initialize caching system
+        self.cache_enabled = getattr(config, 'enable_frame_cache', True)
+        self.cache_threshold = getattr(config, 'cache_similarity_threshold', 0.95)
+        self.block_caches: Dict[Tuple[str, int], deque] = {}  # (stage, idx) -> deque of CacheEntry
+        self.max_cache_per_block = 3
+        self.cache_stats = {"hits": 0, "misses": 0}
+
+        # Advanced memory management for small devices
+        self.memory_budget_mb = config.memory_budget_mb or 18000  # Default 18GB for safety
+        self.memory_safety_margin = getattr(config, 'memory_safety_margin', 0.15)  # 15% safety
+        self.block_memory: Dict[Tuple[str, int], int] = {}  # Track memory per block
+        self.access_history: Dict[Tuple[str, int], deque] = {}  # Track access patterns
+        self.prefetch_queue: deque = deque(maxlen=3)  # Blocks to prefetch
 
         self.double_blocks = list(getattr(transformer, "double_blocks", []))
         self.single_blocks = list(getattr(transformer, "single_blocks", []))
@@ -266,6 +300,150 @@ class RabbitRuntimeManager:
 
         self.transformer.set_runtime_context(self._current_context)
 
+    def _compute_input_hash(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Compute a compact hash of inputs for similarity checking."""
+        hashes = []
+        for inp in inputs:
+            if isinstance(inp, torch.Tensor):
+                with torch.no_grad():
+                    # Take strategic samples: first, middle, last elements
+                    flat = inp.flatten()
+                    n = flat.numel()
+                    if n > 30:
+                        # Sample from beginning, middle, and end
+                        indices = torch.tensor([0, 1, 2, n//2-1, n//2, n//2+1, n-3, n-2, n-1])
+                        sample = flat[indices]
+                    else:
+                        sample = flat[:min(10, n)]
+                    hashes.append(sample.detach().cpu())
+
+        if hashes:
+            return torch.cat(hashes)
+        return torch.tensor([])
+
+    def _check_cache(self, stage: str, index: int, inputs: Tuple[torch.Tensor, ...]) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Check if we have cached outputs for similar inputs."""
+        if not self.cache_enabled:
+            return None
+
+        cache_key = (stage, index)
+        if cache_key not in self.block_caches:
+            return None
+
+        input_hash = self._compute_input_hash(inputs)
+        step = self._current_context.step_index if self._current_context else 0
+
+        # Check cache entries (recent first for temporal locality)
+        for entry in reversed(self.block_caches[cache_key]):
+            # Prioritize temporally close entries
+            if abs(entry.step_index - step) <= 2 and entry.check_similarity(input_hash, self.cache_threshold):
+                entry.hits += 1
+                self.cache_stats["hits"] += 1
+                return entry.outputs
+
+        # Check all entries if no temporal match
+        for entry in self.block_caches[cache_key]:
+            if entry.check_similarity(input_hash, self.cache_threshold):
+                entry.hits += 1
+                self.cache_stats["hits"] += 1
+                return entry.outputs
+
+        self.cache_stats["misses"] += 1
+        return None
+
+    def _update_cache(self, stage: str, index: int, inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, ...]):
+        """Store outputs in cache for future reuse."""
+        if not self.cache_enabled:
+            return
+
+        cache_key = (stage, index)
+        if cache_key not in self.block_caches:
+            self.block_caches[cache_key] = deque(maxlen=self.max_cache_per_block)
+
+        input_hash = self._compute_input_hash(inputs)
+        step = self._current_context.step_index if self._current_context else 0
+
+        # Store detached outputs to avoid memory leaks
+        cached_outputs = tuple(out.detach() for out in outputs)
+        entry = CacheEntry(input_hash, cached_outputs, step)
+        self.block_caches[cache_key].append(entry)
+
+    def _get_block_memory(self, block: torch.nn.Module) -> int:
+        """Estimate memory usage of a block in bytes."""
+        if not hasattr(block, '_cached_size'):
+            total_bytes = 0
+            for param in block.parameters(recurse=True):
+                total_bytes += param.numel() * param.element_size()
+            block._cached_size = total_bytes
+        return block._cached_size
+
+    def _should_keep_on_device(self, stage: str, index: int) -> bool:
+        """Determine if block should stay on device based on access patterns."""
+        key = (stage, index)
+        if key not in self.access_history:
+            return False
+
+        # Check access frequency in recent steps
+        recent_accesses = list(self.access_history[key])[-5:]
+        if len(recent_accesses) < 2:
+            return False
+
+        # Keep on device if accessed frequently
+        access_density = len(recent_accesses) / 5
+        return access_density > 0.6
+
+    def _manage_memory_for_block(self, stage: str, index: int, block: torch.nn.Module):
+        """Intelligent memory management for small devices."""
+        if not self.config.weights_offload_enabled:
+            return
+
+        key = (stage, index)
+        block_size = self._get_block_memory(block)
+
+        # Track this access
+        if key not in self.access_history:
+            self.access_history[key] = deque(maxlen=10)
+        step = self._current_context.step_index if self._current_context else 0
+        self.access_history[key].append(step)
+
+        # Calculate current GPU memory usage
+        current_usage = sum(self.block_memory.values())
+        available_budget = self.memory_budget_mb * 1024 * 1024 * (1 - self.memory_safety_margin)
+
+        # If block is already on device and we have space, keep it
+        if self._residency[stage][index] == "device":
+            if current_usage + block_size <= available_budget:
+                self.block_memory[key] = block_size
+                return
+
+        # Need to load block - check if we need to evict others
+        space_needed = block_size
+        if current_usage + space_needed > available_budget:
+            # Find blocks to evict (LRU with importance weighting)
+            eviction_candidates = []
+            for (s, i), history in self.access_history.items():
+                if (s, i) == key or (s, i) not in self.block_memory:
+                    continue
+                if self._residency[s][i] == "device":
+                    # Calculate eviction score (lower = evict first)
+                    last_access = max(history) if history else -1
+                    importance = self._states[s][i].ema_importance
+                    score = last_access * (1 + importance)
+                    eviction_candidates.append((score, s, i))
+
+            # Evict blocks with lowest scores
+            eviction_candidates.sort()
+            for _, s, i in eviction_candidates:
+                if current_usage + space_needed <= available_budget:
+                    break
+                evict_block = self._blocks[s][i]
+                self._offload_block(s, i, evict_block)
+                current_usage -= self.block_memory.pop((s, i), 0)
+
+        # Load the required block
+        self._ensure_on_device(stage, index, block)
+        self.block_memory[key] = block_size
+
     def before_block(
         self,
         stage: StageName,
@@ -275,6 +453,16 @@ class RabbitRuntimeManager:
     ) -> BlockDecision:
         if self.profiling_active:
             return BlockDecision(skip=False)
+
+        # First check cache for computation reuse
+        cached_outputs = self._check_cache(stage, index, inputs)
+        if cached_outputs is not None:
+            self.stats["skipped"][stage][index] += 1
+            if self.config.log_stats:
+                self.logger.info(f"[Rabbit] CACHE HIT: {stage}[{index}] - Reusing cached outputs")
+            return BlockDecision(skip=True, outputs=cached_outputs)
+
+        # Original skip logic
         if self.config.skip_enabled and self.config.stage_enabled(stage):
             if self._should_skip(stage, index):
                 outputs = tuple(t for t in inputs)
@@ -285,8 +473,10 @@ class RabbitRuntimeManager:
                     self.logger.info(f"[Rabbit] Block SKIPPED: {stage}[{index}] - "
                                    f"Total skips: {self.stats['skipped'][stage][index]}")
                 return BlockDecision(skip=True, outputs=outputs)
+
+        # Smart memory management for small devices
         if self.config.weights_offload_enabled:
-            self._ensure_on_device(stage, index, block)
+            self._manage_memory_for_block(stage, index, block)
             self._schedule_prefetch(stage, index)
 
         return BlockDecision(skip=False)
@@ -305,14 +495,21 @@ class RabbitRuntimeManager:
         self.stats["executed"][stage][index] += 1
         self.stats["importance"][stage][index] = state.ema_importance
 
+        # Update cache with new outputs
+        self._update_cache(stage, index, inputs, outputs)
+
         if self.config.log_stats and state.total_observations % 10 == 0:
             self.logger.info(f"[Rabbit] Block EXECUTED: {stage}[{index}] - "
                            f"delta={delta:.4e}, importance={state.ema_importance:.4e}")
 
+        # Smart offloading decision
         should_retain = self._maybe_promote_hot_block(stage, index, block)
 
         if self.config.weights_offload_enabled and not should_retain:
-            self._offload_block(stage, index, block)
+            # Check if this block should be kept based on access patterns
+            if not self._should_keep_on_device(stage, index):
+                self._offload_block(stage, index, block)
+                self.block_memory.pop((stage, index), None)
 
         return outputs
 
@@ -384,6 +581,27 @@ class RabbitRuntimeManager:
 
         if self.config.weights_offload_enabled:
             self.logger.info(f"[Rabbit] Weight offloading: ENABLED (device: {self.config.offload_device})")
+
+        # Report cache statistics
+        if self.cache_enabled:
+            total_cache_accesses = self.cache_stats["hits"] + self.cache_stats["misses"]
+            if total_cache_accesses > 0:
+                hit_rate = self.cache_stats["hits"] / total_cache_accesses
+                self.logger.info("-" * 40)
+                self.logger.info("[Rabbit] CACHE STATISTICS:")
+                self.logger.info(f"  Cache hit rate: {hit_rate:.2%}")
+                self.logger.info(f"  Total hits: {self.cache_stats['hits']}")
+                self.logger.info(f"  Total misses: {self.cache_stats['misses']}")
+                self.logger.info(f"  Computation saved by cache: ~{hit_rate * 30:.1f}%")
+
+        # Report memory management statistics
+        if self.config.weights_offload_enabled and self.block_memory:
+            peak_memory_mb = max(sum(self.block_memory.values()), 1) / (1024 * 1024)
+            self.logger.info("-" * 40)
+            self.logger.info("[Rabbit] MEMORY MANAGEMENT:")
+            self.logger.info(f"  Peak GPU memory for blocks: {peak_memory_mb:.1f} MB")
+            self.logger.info(f"  Memory budget: {self.memory_budget_mb:.1f} MB")
+            self.logger.info(f"  Safety margin: {self.memory_safety_margin:.1%}")
 
         self.logger.info("=" * 60)
         return summary
