@@ -372,11 +372,6 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(title="Rabbit runtime args")
 
     group.add_argument(
-        "--rabbit-enable",
-        action="store_true",
-        help="Enable RabbitVideo-inspired runtime optimizations (offloading, caching, latent offload).",
-    )
-    group.add_argument(
         "--rabbit-offload",
         action="store_true",
         help="Stream transformer block weights from host memory so the model fits tighter VRAM budgets.",
@@ -439,57 +434,10 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
         help="Block execution count threshold before a block becomes a hot resident.",
     )
     group.add_argument(
-        "--rabbit-cache-outputs",
-        action="store_true",
-        help="Enable block output caching so low-variance blocks can reuse features across steps.",
-    )
-    group.add_argument(
-        "--rabbit-cache-threshold",
-        type=float,
-        default=0.02,
-        help="Maximum normalized drift between cached and current block inputs before recomputing.",
-    )
-    group.add_argument(
-        "--rabbit-cache-max-age",
-        type=int,
-        default=6,
-        help="Maximum number of denoising steps to reuse a cached block output before forcing recompute.",
-    )
-    group.add_argument(
-        "--rabbit-cache-min-importance",
-        type=float,
-        default=5e-4,
-        help="Blocks with EMA importance below this value are treated as cache-friendly.",
-    )
-    group.add_argument(
-        "--rabbit-cache-token-ratio",
-        type=float,
-        default=1.0,
-        help="Fraction (0-1) of tokens to keep when storing cached outputs. Remaining tokens fall back to identity on reuse.",
-    )
-    group.add_argument(
-        "--rabbit-cache-warmup-steps",
-        type=int,
-        default=0,
-        help="Number of initial diffusion steps to bypass cache reuse (TeaCache-inspired warmup).",
-    )
-    group.add_argument(
         "--rabbit-profile-steps",
         type=int,
         default=0,
         help="Number of initial diffusion steps to collect block statistics before enabling Rabbit optimizations.",
-    )
-    group.add_argument(
-        "--rabbit-cfg-reuse-interval",
-        type=int,
-        default=1,
-        help="Reuse cached unconditional branch every N steps when using classifier-free guidance (>=1).",
-    )
-
-    group.add_argument(
-        "--rabbit-latent-offload",
-        action="store_true",
-        help="Offload denoised latents to CPU between diffusion steps to reduce HBM usage.",
     )
     group.add_argument(
         "--rabbit-log-stats",

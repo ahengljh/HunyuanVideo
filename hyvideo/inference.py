@@ -188,19 +188,22 @@ class Inference(object):
         # Disable gradient
         torch.set_grad_enabled(False)
 
-        if getattr(args, "rabbit_enable", False) and args.use_cpu_offload:
+        rabbit_flag = False
+        if getattr(args, "rabbit_offload", None) is not None:
+            rabbit_flag = bool(args.rabbit_offload)
+        else:
+            rabbit_flag = getattr(args, "rabbit_offload_mode", "none") != "none"
+
+        if rabbit_flag and args.use_cpu_offload:
             raise ValueError(
                 "Rabbit runtime optimizations cannot be combined with accelerate's sequential CPU offload."
             )
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        if getattr(args, "rabbit_offload", None) is not None:
-            rabbit_offload_active = bool(args.rabbit_offload)
-        else:
-            rabbit_offload_active = getattr(args, "rabbit_offload_mode", "none") != "none"
+        rabbit_offload_active = rabbit_flag
 
-        should_force_cpu = getattr(args, "rabbit_enable", False) and rabbit_offload_active
+        should_force_cpu = rabbit_offload_active
 
         factor_kwargs_device = torch.device("cpu") if should_force_cpu else device
         factor_kwargs = {

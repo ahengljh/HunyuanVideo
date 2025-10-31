@@ -27,24 +27,9 @@ class RabbitRuntimeConfig:
     aggressive_offload: bool = True
     hot_resident_limit: int = 0
     hot_resident_threshold: int = 24
-    cache_outputs: bool = False
-    cache_device: str = "cpu"
-    cache_threshold: float = 0.02
-    cache_max_age: int = 6
-    cache_min_importance: float = 5e-4
-    cache_stage: str = "both"
-    cache_token_ratio: float = 1.0
-    cache_warmup_steps: int = 0
-    cache_min_progress: float = 0.0
-    cache_progress_power: float = 1.0
+    trace_residency_path: Optional[str] = None
     profile_steps: int = 0
     profile_low_ratio: float = 0.5
-    profile_cache: bool = True
-    profile_offload: bool = True
-
-    latent_offload: bool = False
-    latent_offload_device: str = "cpu"
-    latent_pin_memory: bool = True
 
     skip_strategy: str = "none"  # none | ema | schedule
     skip_threshold: float = 1e-3
@@ -72,24 +57,21 @@ class RabbitRuntimeConfig:
     def skip_enabled(self) -> bool:
         return self.enabled and self.skip_strategy != "none"
 
-    @property
-    def cache_enabled(self) -> bool:
-        return self.enabled and self.cache_outputs
-
 
 def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     """Create a :class:`RabbitRuntimeConfig` from CLI args and model metadata."""
 
     cfg = RabbitRuntimeConfig()
-    cfg.enabled = bool(getattr(args, "rabbit_enable", False))
-    if not cfg.enabled:
-        return cfg
 
     offload_flag = getattr(args, "rabbit_offload", None)
     if offload_flag is None:
         cfg.offload_mode = getattr(args, "rabbit_offload_mode", "none")
     else:
         cfg.offload_mode = "weights" if offload_flag else "none"
+
+    cfg.enabled = cfg.offload_mode != "none"
+    if not cfg.enabled:
+        return cfg
 
     cfg.offload_device = getattr(args, "rabbit_offload_device", cfg.offload_device)
     cfg.prefetch_distance = max(0, int(getattr(args, "rabbit_prefetch_distance", cfg.prefetch_distance)))
@@ -105,26 +87,15 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.aggressive_offload = bool(getattr(args, "rabbit_aggressive_offload", cfg.aggressive_offload))
     if cfg.aggressive_offload and cfg.prefetch_distance > 0:
         cfg.prefetch_distance = 0
-    cfg.cache_outputs = bool(getattr(args, "rabbit_cache_outputs", False))
-    cfg.cache_device = "cpu"
-    cfg.cache_threshold = float(getattr(args, "rabbit_cache_threshold", cfg.cache_threshold))
-    cfg.cache_max_age = max(1, int(getattr(args, "rabbit_cache_max_age", cfg.cache_max_age)))
-    cfg.cache_min_importance = float(getattr(args, "rabbit_cache_min_importance", cfg.cache_min_importance))
-    cfg.cache_stage = "both"
-    cfg.cache_token_ratio = coerce_ratio(
-        getattr(args, "rabbit_cache_token_ratio", cfg.cache_token_ratio), cfg.cache_token_ratio
-    )
-    cfg.cache_warmup_steps = max(0, int(getattr(args, "rabbit_cache_warmup_steps", cfg.cache_warmup_steps)))
-    # Cache gating uses baked-in defaults today; expose fewer knobs on CLI.
     cfg.profile_steps = max(0, int(getattr(args, "rabbit_profile_steps", cfg.profile_steps)))
-
-    cfg.latent_offload = bool(getattr(args, "rabbit_latent_offload", False))
 
     cfg.skip_strategy = "none"
 
     cfg.log_stats = bool(getattr(args, "rabbit_log_stats", False))
     cfg.hot_resident_limit = max(0, int(getattr(args, "rabbit_hot_resident_limit", cfg.hot_resident_limit)))
     cfg.hot_resident_threshold = max(1, int(getattr(args, "rabbit_hot_resident_threshold", cfg.hot_resident_threshold)))
+    trace_path = getattr(args, "rabbit_residency_trace", None)
+    cfg.trace_residency_path = str(trace_path) if trace_path else None
 
     resident_str = getattr(args, "rabbit_resident_plan", None)
     cfg.resident_plan = parse_resident_plan(resident_str, transformer)

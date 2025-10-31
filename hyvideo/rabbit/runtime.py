@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from statistics import mean
 from typing import Dict, List, Optional, Tuple, Union
@@ -42,8 +44,6 @@ class BlockState:
     skip_cooldown: int = 0
     skip_streak: int = 0
     last_delta: float = 0.0
-    cache_entry: Optional["BlockCacheEntry"] = None
-    cache_age: int = 0
 
     def register_execution(self, delta: float, decay: float):
         self.executed += 1
@@ -73,14 +73,6 @@ class BlockDecision:
     outputs: Optional[Tuple[torch.Tensor, ...]] = None
 
 
-@dataclass
-class BlockCacheEntry:
-    outputs: Tuple[torch.Tensor, ...]
-    signature: torch.Tensor
-    step_index: int
-    token_masks: Optional[Tuple[Optional[torch.Tensor], ...]] = None
-
-
 class RabbitRuntimeManager:
     """Runtime controller implementing RabbitVideo-inspired optimisations."""
 
@@ -97,8 +89,6 @@ class RabbitRuntimeManager:
         self.logger = logger_instance or logger
 
         self.offload_device = torch.device(config.offload_device)
-        self.latent_offload_device = torch.device(config.latent_offload_device)
-        self.cache_device = torch.device(config.cache_device)
 
         self.double_blocks = list(getattr(transformer, "double_blocks", []))
         self.single_blocks = list(getattr(transformer, "single_blocks", []))
@@ -133,8 +123,6 @@ class RabbitRuntimeManager:
         self._current_context: Optional[BlockExecutionContext] = None
         self._max_timestep: Optional[float] = None
 
-        self.latent_cache_enabled = self.config.latent_offload
-
         self.stats: Dict[str, Dict[StageName, List[float]]] = {
             "executed": {
                 stage: [0 for _ in modules] for stage, modules in self._blocks.items()
@@ -145,12 +133,6 @@ class RabbitRuntimeManager:
             "importance": {
                 stage: [0.0 for _ in modules] for stage, modules in self._blocks.items()
             },
-            "cache_hits": {
-                stage: [0 for _ in modules] for stage, modules in self._blocks.items()
-            },
-        }
-        self._cache_whitelist: Dict[StageName, Optional[set]] = {
-            stage: None for stage in self._blocks.keys()
         }
         self._hot_residents: Dict[StageName, set] = {
             stage: set() for stage in self._blocks.keys()
@@ -158,6 +140,21 @@ class RabbitRuntimeManager:
         self._hot_order: Dict[StageName, List[int]] = {
             stage: [] for stage in self._blocks.keys()
         }
+        self.trace_enabled = bool(self.config.trace_residency_path)
+        self.trace_path: Optional[Path] = (
+            Path(self.config.trace_residency_path)
+            if self.config.trace_residency_path
+            else None
+        )
+        self._trace_records: List[Dict[str, Union[str, int, float]]] = []
+        if self.trace_enabled:
+            self._trace_event(
+                {
+                    "event": "init",
+                    "double_blocks": len(self.double_blocks),
+                    "single_blocks": len(self.single_blocks),
+                }
+            )
         self.profiling_steps = max(0, self.config.profile_steps)
         self.profiling_active = self.profiling_steps > 0
         self._profile_finalized = False
@@ -221,44 +218,19 @@ class RabbitRuntimeManager:
                 for stage, indices in config.offload_plan.items():
                     if indices:
                         self.logger.info(f"[Rabbit] Offloading {stage} blocks: {len(indices)} blocks")
-            if config.cache_enabled:
-                self.logger.info(
-                    "[Rabbit] Output caching enabled on %s blocks (device: %s, threshold=%.3g)",
-                    config.cache_stage,
-                    config.cache_device,
-                    config.cache_threshold,
-                )
-            if config.latent_offload:
-                self.logger.info(f"[Rabbit] Latent Offloading: ENABLED")
             self.logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     # Public API used by the pipeline
     # ------------------------------------------------------------------
     def register_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        if not self.latent_cache_enabled:
-            return latents
-        if latents.device == self.latent_offload_device:
-            return latents
-        latents_cpu = latents.to(self.latent_offload_device, non_blocking=self.device.type == "cuda")
-        if self.latent_offload_device.type == "cpu" and self.config.latent_pin_memory:
-            latents_cpu = latents_cpu.pin_memory()
-        return latents_cpu
+        return latents
 
     def latents_to_device(self, latents: torch.Tensor) -> torch.Tensor:
-        if not self.latent_cache_enabled:
-            return latents
-        if latents.device == self.device:
-            return latents
-        return latents.to(self.device, non_blocking=self.device.type == "cuda")
+        return latents
 
     def after_step(self, latents: torch.Tensor) -> torch.Tensor:
-        if not self.latent_cache_enabled:
-            return latents
-        latents_cpu = latents.to(self.latent_offload_device, non_blocking=self.device.type == "cuda")
-        if self.latent_offload_device.type == "cpu" and self.config.latent_pin_memory:
-            latents_cpu = latents_cpu.pin_memory()
-        return latents_cpu
+        return latents
 
     def update_step(self, step_index: int, timestep: Union[float, torch.Tensor], total_steps: int):
         if isinstance(timestep, torch.Tensor):
@@ -313,10 +285,6 @@ class RabbitRuntimeManager:
                     self.logger.info(f"[Rabbit] Block SKIPPED: {stage}[{index}] - "
                                    f"Total skips: {self.stats['skipped'][stage][index]}")
                 return BlockDecision(skip=True, outputs=outputs)
-        cached = self._try_cache_reuse(stage, index, inputs)
-        if cached is not None:
-            return BlockDecision(skip=True, outputs=cached)
-
         if self.config.weights_offload_enabled:
             self._ensure_on_device(stage, index, block)
             self._schedule_prefetch(stage, index)
@@ -345,13 +313,27 @@ class RabbitRuntimeManager:
 
         if self.config.weights_offload_enabled and not should_retain:
             self._offload_block(stage, index, block)
-        if self._stage_cache_enabled(stage):
-            self._update_cache_entry(stage, index, block_inputs=inputs, block_outputs=outputs)
 
         return outputs
 
     def finalize(self) -> Optional[Dict[str, Dict[str, float]]]:
         self.transformer.set_runtime_context(None)
+        if self.trace_enabled:
+            self._trace_event({"event": "finalize"})
+            if self.trace_path is not None:
+                try:
+                    self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+                    with self.trace_path.open("w", encoding="utf-8") as f:
+                        for record in self._trace_records:
+                            f.write(json.dumps(record) + "\n")
+                    if self.config.log_stats:
+                        self.logger.info(
+                            f"[Rabbit] Residency trace written to {self.trace_path}"
+                        )
+                except OSError as exc:
+                    self.logger.warning(
+                        f"[Rabbit] Failed to write residency trace to {self.trace_path}: {exc}"
+                    )
         if not self.config.log_stats:
             return None
 
@@ -365,9 +347,6 @@ class RabbitRuntimeManager:
             "mean_importance": {
                 stage: (mean(values) if values else 0.0)
                 for stage, values in self.stats["importance"].items()
-            },
-            "cache_hits": {
-                stage: sum(values) for stage, values in self.stats["cache_hits"].items()
             },
         }
 
@@ -392,9 +371,6 @@ class RabbitRuntimeManager:
             self.logger.info(f"  - Executed: {exec_count}/{total_blocks} blocks")
             self.logger.info(f"  - Skipped:  {skip_count}/{total_blocks} blocks ({skip_rate:.1f}%)")
             self.logger.info(f"  - Mean importance: {mean_importance:.4e}")
-            cache_hits = summary["cache_hits"].get(stage, 0)
-            if cache_hits > 0:
-                self.logger.info(f"  - Cache hits: {cache_hits}")
 
             total_blocks_exec += exec_count
             total_blocks_skip += skip_count
@@ -408,10 +384,6 @@ class RabbitRuntimeManager:
 
         if self.config.weights_offload_enabled:
             self.logger.info(f"[Rabbit] Weight offloading: ENABLED (device: {self.config.offload_device})")
-        if self.config.cache_enabled:
-            self.logger.info(f"[Rabbit] Output caching: ENABLED (device: {self.config.cache_device})")
-        if self.config.latent_offload:
-            self.logger.info(f"[Rabbit] Latent offloading: ENABLED")
 
         self.logger.info("=" * 60)
         return summary
@@ -419,6 +391,32 @@ class RabbitRuntimeManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _trace_event(self, payload: Dict[str, Union[str, int, float]]) -> None:
+        if not self.trace_enabled:
+            return
+        event = dict(payload)
+        if "step" not in event:
+            event["step"] = (
+                self._current_context.step_index
+                if self._current_context is not None
+                else -1
+            )
+        event["order"] = len(self._trace_records)
+        self._trace_records.append(event)
+
+    def _trace_residency(
+        self, stage: StageName, index: int, status: str, action: str
+    ) -> None:
+        self._trace_event(
+            {
+                "event": "residency",
+                "stage": stage,
+                "block": index,
+                "status": status,
+                "action": action,
+            }
+        )
+
     def _prepare_module_residency(self):
         if self.profiling_active or not self.config.weights_offload_enabled:
             self.transformer.to(self.device)
@@ -426,6 +424,7 @@ class RabbitRuntimeManager:
                 for idx, module in enumerate(modules):
                     module.to(self.device)
                     self._residency[stage][idx] = "device"
+                    self._trace_residency(stage, idx, "device", "init")
             return
 
         self._move_persistent_modules_to_device()
@@ -436,9 +435,11 @@ class RabbitRuntimeManager:
                 if idx in target_set:
                     module.to(self.offload_device)
                     self._residency[stage][idx] = "offload"
+                    self._trace_residency(stage, idx, "offload", "init_plan")
                 else:
                     module.to(self.device)
                     self._residency[stage][idx] = "device"
+                    self._trace_residency(stage, idx, "device", "init_plan")
 
     def _move_persistent_modules_to_device(self):
         persistent_attrs = [
@@ -469,10 +470,12 @@ class RabbitRuntimeManager:
                 torch.cuda.current_stream(self.device).wait_stream(self._prefetch_stream)
             self._residency[stage][index] = "device"
             self._prefetched.pop((stage, index), None)
+            self._trace_residency(stage, index, "device", "prefetch_commit")
             return
 
         block.to(self.device, non_blocking=self.device.type == "cuda")
         self._residency[stage][index] = "device"
+        self._trace_residency(stage, index, "device", "load")
 
     def _schedule_prefetch(self, stage: StageName, index: int):
         if (
@@ -500,6 +503,7 @@ class RabbitRuntimeManager:
                 next_block.to(self.device, non_blocking=True)
             self._prefetched[key] = True
             self._residency[stage][next_index] = "prefetch"
+            self._trace_residency(stage, next_index, "prefetch", "prefetch_schedule")
 
     def _offload_block(
         self, stage: StageName, index: int, block: torch.nn.Module
@@ -517,6 +521,7 @@ class RabbitRuntimeManager:
             self._hot_residents[stage].remove(index)
             if index in self._hot_order[stage]:
                 self._hot_order[stage].remove(index)
+        self._trace_residency(stage, index, "offload", "evict")
 
     def _maybe_promote_hot_block(
         self, stage: StageName, index: int, block: torch.nn.Module
@@ -545,6 +550,7 @@ class RabbitRuntimeManager:
         if self.device.type == "cuda" and self._residency[stage][index] != "device":
             block.to(self.device, non_blocking=True)
             self._residency[stage][index] = "device"
+            self._trace_residency(stage, index, "device", "hot_promote")
 
         while len(self._hot_residents[stage]) > self.config.hot_resident_limit:
             evict_index = self._hot_order[stage].pop(0)
@@ -565,133 +571,7 @@ class RabbitRuntimeManager:
         block = self._blocks[stage][index]
         block.to(self.offload_device, non_blocking=self.device.type == "cuda")
         self._residency[stage][index] = "offload"
-
-    def _stage_cache_enabled(self, stage: StageName) -> bool:
-        if not self.config.cache_enabled or self.profiling_active:
-            return False
-        allowlist = self._cache_whitelist.get(stage)
-        if allowlist is not None and len(allowlist) == 0:
-            return False
-        if self.config.cache_stage == "both":
-            return True
-        return stage == self.config.cache_stage
-
-    def _build_signature(self, tensors: Tuple[torch.Tensor, ...]) -> Optional[torch.Tensor]:
-        stats: List[torch.Tensor] = []
-        for tensor in tensors:
-            if not isinstance(tensor, torch.Tensor):
-                continue
-            flat = tensor.detach().float()
-            if flat.numel() == 0:
-                continue
-            mean_val = flat.mean()
-            std_val = flat.std(unbiased=False)
-            stats.append(torch.stack((mean_val, std_val)))
-        if not stats:
-            return None
-        stacked = torch.stack(stats).mean(dim=0)
-        return stacked.to(self.cache_device)
-
-    def _signature_drift(self, current: torch.Tensor, cached: torch.Tensor) -> float:
-        diff = torch.mean(torch.abs(current - cached))
-        norm = torch.mean(torch.abs(cached)).clamp(min=1e-6)
-        return (diff / norm).item()
-
-    def _try_cache_reuse(
-        self, stage: StageName, index: int, inputs: Tuple[torch.Tensor, ...]
-    ) -> Optional[Tuple[torch.Tensor, ...]]:
-        if not self._stage_cache_enabled(stage):
-            return None
-        state = self._states[stage][index]
-        entry = state.cache_entry
-        if entry is None or self._current_context is None:
-            return None
-        allowlist = self._cache_whitelist.get(stage)
-        if allowlist is not None and index not in allowlist:
-            return None
-        age = self._current_context.step_index - entry.step_index
-        if age <= 0 or age > self.config.cache_max_age:
-            return None
-        # Inspired by ToCa (Zou et al., 2025), prefer caching for low-impact tokens/blocks only.
-        if state.ema_importance > self.config.cache_min_importance:
-            return None
-        signature = self._build_signature(inputs)
-        if signature is None:
-            return None
-        drift = self._signature_drift(signature, entry.signature)
-        threshold = self._cache_threshold()
-        if threshold is None:
-            return None
-        if drift > threshold:
-            return None
-
-        outputs_list: List[torch.Tensor] = []
-        for i, tensor in enumerate(entry.outputs):
-            out_tensor = (
-                tensor.to(self.device, non_blocking=self.device.type == "cuda")
-                if tensor.device != self.device
-                else tensor.clone()
-            )
-            mask = None
-            if entry.token_masks is not None and i < len(entry.token_masks):
-                mask = entry.token_masks[i]
-            if mask is not None:
-                mask_dev = mask.to(self.device, non_blocking=self.device.type == "cuda")
-                expanded = self._expand_token_mask(mask_dev, out_tensor)
-                input_tensor = inputs[i].to(self.device)
-                out_tensor = torch.where(expanded, out_tensor, input_tensor)
-            outputs_list.append(out_tensor)
-        outputs = tuple(outputs_list)
-        self.stats["cache_hits"][stage][index] += 1
-        state.cache_age += 1
-        if self.config.log_stats:
-            self.logger.info(
-                "[Rabbit] Cache REUSE: %s[%d] age=%d drift=%.3g",
-                stage,
-                index,
-                age,
-                drift,
-            )
-        return outputs
-
-    def _update_cache_entry(
-        self,
-        stage: StageName,
-        index: int,
-        block_inputs: Tuple[torch.Tensor, ...],
-        block_outputs: Tuple[torch.Tensor, ...],
-    ):
-        # Inspired by ProfilingDiT (Ma et al., 2025) and TeaCache (Liu et al., 2025),
-        # we only cache low-variance blocks and track lightweight signatures.
-        signature = self._build_signature(block_inputs)
-        if signature is None or self._current_context is None:
-            self._states[stage][index].cache_entry = None
-            return
-        allowlist = self._cache_whitelist.get(stage)
-        if allowlist is not None and index not in allowlist:
-            self._states[stage][index].cache_entry = None
-            return
-        outputs = tuple(
-            tensor.detach().to(self.cache_device, non_blocking=self.device.type == "cuda")
-            for tensor in block_outputs
-        )
-        token_masks: List[Optional[torch.Tensor]] = []
-        ratio = self.config.cache_token_ratio
-        if ratio < 1.0:
-            for inp, out in zip(block_inputs, block_outputs):
-                mask = self._compute_token_mask(inp, out, ratio)
-                token_masks.append(
-                    mask.to(self.cache_device) if mask is not None else None
-                )
-        else:
-            token_masks = [None for _ in block_outputs]
-        self._states[stage][index].cache_entry = BlockCacheEntry(
-            outputs=outputs,
-            signature=signature,
-            step_index=self._current_context.step_index,
-            token_masks=tuple(token_masks),
-        )
-        self._states[stage][index].cache_age = 0
+        self._trace_residency(stage, index, "offload", "hot_demote")
 
     def _finalize_profile(self):
         if self._profile_finalized or self.profiling_steps <= 0:
@@ -714,17 +594,6 @@ class RabbitRuntimeManager:
                 selected = {idx for idx, _ in ranked[:count]}
                 profile_sets[stage] = selected
 
-        if self.config.profile_cache:
-            for stage in self._blocks.keys():
-                self._cache_whitelist[stage] = set(profile_sets.get(stage, set()))
-
-        if self.config.profile_offload and self.config.weights_offload_enabled:
-            new_plan: Dict[StageName, set] = {}
-            for stage in self._blocks.keys():
-                base = set(self._offload_sets.get(stage, set()))
-                new_plan[stage] = base.union(profile_sets.get(stage, set()))
-            self._apply_offload_plan(new_plan)
-
         if self.config.log_stats:
             for stage, indices in profile_sets.items():
                 if indices:
@@ -733,10 +602,6 @@ class RabbitRuntimeManager:
                         stage,
                         sorted(indices),
                     )
-            if self.config.profile_offload and self.config.weights_offload_enabled:
-                self.logger.info("[Rabbit] Profiling-adjusted offload plan applied")
-            if self.config.profile_cache:
-                self.logger.info("[Rabbit] Profiling-adjusted caching whitelist applied")
 
     def _apply_offload_plan(self, plan: Dict[StageName, set]):
         for stage, modules in self._blocks.items():
@@ -754,54 +619,6 @@ class RabbitRuntimeManager:
                     self._residency[stage][idx] = "device"
         self._offload_sets = {stage: set(plan.get(stage, set())) for stage in self._blocks.keys()}
         self._prefetched.clear()
-
-    def _compute_token_mask(
-        self, inputs: torch.Tensor, outputs: torch.Tensor, ratio: float
-    ) -> Optional[torch.Tensor]:
-        if ratio <= 0 or outputs.ndim < 3:
-            return None
-        if inputs.shape[:2] != outputs.shape[:2]:
-            return None
-        # Expect shape (B, L, ...). Compute per-token delta averaged over batch and channels.
-        deltas = (outputs - inputs).abs()
-        dims = list(range(2, deltas.ndim))
-        if dims:
-            deltas = deltas.mean(dim=dims)
-        deltas = deltas.mean(dim=0)  # average across batch
-        tokens = deltas.shape[0]
-        keep = max(0, int(round(tokens * ratio)))
-        if keep >= tokens:
-            return None
-        mask = torch.zeros(tokens, dtype=torch.bool, device=deltas.device)
-        if keep > 0:
-            _, indices = torch.topk(-deltas, k=keep, largest=False)
-            mask.scatter_(0, indices, True)
-        return mask
-
-    def _expand_token_mask(self, mask: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.ndim < 2:
-            return mask
-        shape = [1] * tensor.ndim
-        shape[1] = mask.shape[0]
-        expanded = mask.view(*shape)
-        return expanded
-
-    def _cache_threshold(self) -> Optional[float]:
-        if self._current_context is None:
-            return self.config.cache_threshold
-        if (
-            self._current_context.step_index + 1
-            <= self.config.cache_warmup_steps
-        ):
-            return None
-        progress = max(
-            self._current_context.step_progress,
-            self._current_context.noise_progress,
-        )
-        if progress < self.config.cache_min_progress:
-            return None
-        scaled = progress ** max(self.config.cache_progress_power, 0.0)
-        return self.config.cache_threshold * scaled
 
     def _compute_importance(
         self,
