@@ -449,22 +449,21 @@ def add_rabbit_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--rabbit-enable-cache",
         action="store_true",
-        default=True,
-        help="Enable frame similarity caching to reuse computations (default: enabled).",
+        help="Enable frame similarity caching to reuse computations (EXPERIMENTAL - may affect quality).",
     )
     group.add_argument(
         "--no-rabbit-enable-cache",
         dest="rabbit_enable_cache",
         action="store_false",
-        help="Disable frame caching.",
+        help="Disable frame caching (default).",
     )
-    group.set_defaults(rabbit_enable_cache=True)
+    group.set_defaults(rabbit_enable_cache=False)  # Disabled by default for safety
 
     group.add_argument(
         "--rabbit-cache-threshold",
         type=float,
-        default=0.95,
-        help="Cosine similarity threshold for cache hits (default: 0.95, lower = more aggressive).",
+        default=0.98,
+        help="Cosine similarity threshold for cache hits (default: 0.98, lower = more aggressive but may affect quality).",
     )
     group.add_argument(
         "--rabbit-memory-safety",

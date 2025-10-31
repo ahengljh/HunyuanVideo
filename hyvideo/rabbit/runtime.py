@@ -110,9 +110,9 @@ class RabbitRuntimeManager:
 
         self.offload_device = torch.device(config.offload_device)
 
-        # Initialize caching system
-        self.cache_enabled = getattr(config, 'enable_frame_cache', True)
-        self.cache_threshold = getattr(config, 'cache_similarity_threshold', 0.95)
+        # Initialize caching system (disabled by default for safety)
+        self.cache_enabled = getattr(config, 'enable_frame_cache', False)
+        self.cache_threshold = getattr(config, 'cache_similarity_threshold', 0.98)  # Very high threshold
         self.block_caches: Dict[Tuple[str, int], deque] = {}  # (stage, idx) -> deque of CacheEntry
         self.max_cache_per_block = 3
         self.cache_stats = {"hits": 0, "misses": 0}
@@ -363,8 +363,9 @@ class RabbitRuntimeManager:
         input_hash = self._compute_input_hash(inputs)
         step = self._current_context.step_index if self._current_context else 0
 
-        # Store detached outputs to avoid memory leaks
-        cached_outputs = tuple(out.detach() for out in outputs)
+        # Clone outputs to avoid affecting computation
+        # Keep computation graph intact, only detach when retrieving from cache
+        cached_outputs = tuple(out.clone() for out in outputs)
         entry = CacheEntry(input_hash, cached_outputs, step)
         self.block_caches[cache_key].append(entry)
 

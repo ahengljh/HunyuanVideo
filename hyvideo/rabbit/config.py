@@ -44,9 +44,9 @@ class RabbitRuntimeConfig:
     log_stats: bool = False
     diagnostics_interval: int = 5
 
-    # Frame caching for computation reuse
-    enable_frame_cache: bool = True
-    cache_similarity_threshold: float = 0.95
+    # Frame caching for computation reuse (disabled by default for safety)
+    enable_frame_cache: bool = False
+    cache_similarity_threshold: float = 0.98  # Higher threshold for safety
     memory_safety_margin: float = 0.15  # 15% safety margin for small devices
 
     def stage_enabled(self, stage: str) -> bool:
@@ -103,8 +103,8 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.trace_residency_path = str(trace_path) if trace_path else None
 
     # Configure frame caching and memory management
-    cfg.enable_frame_cache = bool(getattr(args, "rabbit_enable_cache", True))
-    cfg.cache_similarity_threshold = float(getattr(args, "rabbit_cache_threshold", 0.95))
+    cfg.enable_frame_cache = bool(getattr(args, "rabbit_enable_cache", False))  # Disabled by default
+    cfg.cache_similarity_threshold = float(getattr(args, "rabbit_cache_threshold", 0.98))
     cfg.memory_safety_margin = float(getattr(args, "rabbit_memory_safety", 0.15))
 
     resident_str = getattr(args, "rabbit_resident_plan", None)
