@@ -16,6 +16,7 @@ from hyvideo.text_encoder import TextEncoder
 from hyvideo.utils.data_utils import align_to
 from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.modules.fp8_optimization import convert_fp8_linear
+from hyvideo.modules.lazy_loader import load_state_dict_lazy
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 from hyvideo.rabbit import build_runtime_config
@@ -370,20 +371,57 @@ class Inference(object):
 
         if not model_path.exists():
             raise ValueError(f"model_path not exists: {model_path}")
-        logger.info(f"Loading torch model {model_path}...")
-        state_dict = torch.load(model_path, map_location=lambda storage, loc: storage)
 
-        if bare_model == "unknown" and ("ema" in state_dict or "module" in state_dict):
-            bare_model = False
-        if bare_model is False:
-            if load_key in state_dict:
-                state_dict = state_dict[load_key]
-            else:
-                raise KeyError(
-                    f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
-                    f"are: {list(state_dict.keys())}."
-                )
-        model.load_state_dict(state_dict, strict=True)
+        # Check for safetensors version (preferred for lazy loading)
+        safetensors_path = model_path.with_suffix('.safetensors')
+        if safetensors_path.exists():
+            logger.info(f"Found safetensors version: {safetensors_path}")
+            model_path = safetensors_path
+            # Safetensors files don't have nested keys
+            bare_model = True
+
+        # Check if lazy loading is enabled
+        use_lazy_load = getattr(args, "use_lazy_load", False)
+        lazy_load_batch_size = getattr(args, "lazy_load_batch_size", 2)
+        lazy_load_via_cpu = getattr(args, "lazy_load_via_cpu", False)
+
+        if use_lazy_load:
+            mode_str = "via CPU staging" if lazy_load_via_cpu else "direct"
+            logger.info(f"Loading model with lazy loading ({mode_str}, batch_size={lazy_load_batch_size})...")
+
+            # Determine the load key for lazy loading
+            effective_load_key = None
+            if bare_model is False:
+                effective_load_key = load_key
+
+            # Use lazy loading
+            model = load_state_dict_lazy(
+                checkpoint_path=str(model_path),
+                model=model,
+                load_key=effective_load_key,
+                device=model.device if hasattr(model, 'device') else None,
+                layers_per_batch=lazy_load_batch_size,
+                progress_callback=lambda layer, progress: logger.info(
+                    f"Lazy loading progress: {layer} ({progress*100:.1f}%)"
+                ),
+                via_cpu=lazy_load_via_cpu
+            )
+        else:
+            logger.info(f"Loading torch model {model_path}...")
+            state_dict = torch.load(model_path, map_location=lambda storage, loc: storage)
+
+            if bare_model == "unknown" and ("ema" in state_dict or "module" in state_dict):
+                bare_model = False
+            if bare_model is False:
+                if load_key in state_dict:
+                    state_dict = state_dict[load_key]
+                else:
+                    raise KeyError(
+                        f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
+                        f"are: {list(state_dict.keys())}."
+                    )
+            model.load_state_dict(state_dict, strict=True)
+
         return model
 
     @staticmethod

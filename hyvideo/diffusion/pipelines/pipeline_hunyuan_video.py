@@ -941,6 +941,16 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if prompt_mask_2 is not None:
                 prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
+        # Offload text encoders to CPU when using rabbit runtime to save GPU memory
+        # Text encoders are no longer needed after encoding is complete
+        if rabbit_runtime is not None:
+            if self.text_encoder is not None:
+                self.text_encoder.to("cpu")
+                logger.info("Text encoder offloaded to CPU (rabbit runtime active)")
+            if self.text_encoder_2 is not None:
+                self.text_encoder_2.to("cpu")
+                logger.info("Text encoder 2 offloaded to CPU (rabbit runtime active)")
+            torch.cuda.empty_cache()
 
         # 4. Prepare timesteps
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
@@ -977,6 +987,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         )
         if rabbit_runtime is not None:
             latents = rabbit_runtime.register_latents(latents)
+            # Offload VAE to CPU during denoising loop to save GPU memory
+            # VAE is only needed for final decoding
+            if self.vae is not None:
+                self.vae.to("cpu")
+                logger.info("VAE offloaded to CPU during denoising (rabbit runtime active)")
+                torch.cuda.empty_cache()
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -1124,6 +1140,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         if rabbit_runtime is not None:
             latents = rabbit_runtime.latents_to_device(latents)
+            # Load VAE back to GPU for decoding
+            if self.vae is not None:
+                self.vae.to(device)
+                logger.info("VAE loaded back to GPU for decoding (rabbit runtime active)")
 
         if not output_type == "latent":
             expand_temporal_dim = False

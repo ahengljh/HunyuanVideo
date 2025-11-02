@@ -49,6 +49,10 @@ class RabbitRuntimeConfig:
     cache_similarity_threshold: float = 0.98  # Higher threshold for safety
     memory_safety_margin: float = 0.15  # 15% safety margin for small devices
 
+    # Gradient checkpointing for activation memory reduction
+    enable_checkpointing: bool = True  # Recompute activations to save memory
+    checkpoint_every_n_blocks: int = 1  # Checkpoint every block for maximum savings
+
     def stage_enabled(self, stage: str) -> bool:
         if self.skip_stage == "both":
             return True
@@ -86,9 +90,35 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     )
     if cfg.memory_budget_mb is not None and cfg.memory_budget_mb <= 0:
         cfg.memory_budget_mb = None
+
+    # Auto-detect GPU memory and set sensible budget for small devices
+    if cfg.memory_budget_mb is None and torch.cuda.is_available():
+        try:
+            # Get available GPU memory
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Reserve budget for activations, leaving ~40-50% for model weights
+            # For small GPUs (<=16GB), be more conservative
+            if gpu_memory_gb <= 12:
+                # For 8-12GB GPUs, allocate ~4-6GB for transformer weights
+                cfg.memory_budget_mb = gpu_memory_gb * 1024 * 0.4
+            elif gpu_memory_gb <= 16:
+                # For 12-16GB GPUs, allocate ~6-8GB for transformer weights
+                cfg.memory_budget_mb = gpu_memory_gb * 1024 * 0.45
+            elif gpu_memory_gb <= 24:
+                # For 16-24GB GPUs, allocate ~10-12GB for transformer weights
+                cfg.memory_budget_mb = gpu_memory_gb * 1024 * 0.5
+            # For larger GPUs (>24GB), don't set a budget - let it use what it needs
+        except Exception:
+            # If we can't detect GPU memory, don't set a budget
+            pass
     min_device_blocks = getattr(args, "rabbit_min_device_blocks", None)
     if min_device_blocks is not None:
         cfg.min_device_blocks = max(0, int(min_device_blocks))
+    else:
+        # Smart default: keep only 2-3 blocks resident for small devices
+        # This ensures maximum memory savings while maintaining reasonable performance
+        cfg.min_device_blocks = 2
+
     cfg.aggressive_offload = bool(getattr(args, "rabbit_aggressive_offload", cfg.aggressive_offload))
     if cfg.aggressive_offload and cfg.prefetch_distance > 0:
         cfg.prefetch_distance = 0
@@ -103,7 +133,8 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.trace_residency_path = str(trace_path) if trace_path else None
 
     # Configure frame caching and memory management
-    cfg.enable_frame_cache = bool(getattr(args, "rabbit_enable_cache", False))  # Disabled by default
+    # Enable caching by default when rabbit offload is active - saves memory by reusing similar computations
+    cfg.enable_frame_cache = bool(getattr(args, "rabbit_enable_cache", True))  # Enabled by default for memory savings
     cfg.cache_similarity_threshold = float(getattr(args, "rabbit_cache_threshold", 0.98))
     cfg.memory_safety_margin = float(getattr(args, "rabbit_memory_safety", 0.15))
 

@@ -255,6 +255,23 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use CPU offload for the model load.",
     )
+    group.add_argument(
+        "--use-lazy-load",
+        action="store_true",
+        help="Use lazy loading to reduce peak memory consumption during model loading.",
+    )
+    group.add_argument(
+        "--lazy-load-batch-size",
+        type=int,
+        default=2,
+        help="Number of layers to load at once when using lazy loading (default: 2).",
+    )
+    group.add_argument(
+        "--lazy-load-via-cpu",
+        action="store_true",
+        help="Load entire checkpoint to CPU first, then transfer to GPU layer by layer. "
+        "Good when you have lots of CPU RAM but limited GPU memory.",
+    )
 
     # ======================== Inference general setting ========================
     group.add_argument(
