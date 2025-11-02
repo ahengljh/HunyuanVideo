@@ -53,6 +53,10 @@ class RabbitRuntimeConfig:
     enable_checkpointing: bool = True  # Recompute activations to save memory
     checkpoint_every_n_blocks: int = 1  # Checkpoint every block for maximum savings
 
+    # Latent offloading between stages to save peak memory
+    enable_latent_offload: bool = True  # Offload latents to CPU between stages
+    offload_latents_every_n_blocks: int = 5  # Move latents to CPU every N blocks
+
     def stage_enabled(self, stage: str) -> bool:
         if self.skip_stage == "both":
             return True
@@ -137,6 +141,14 @@ def build_runtime_config(args, transformer) -> RabbitRuntimeConfig:
     cfg.enable_frame_cache = bool(getattr(args, "rabbit_enable_cache", True))  # Enabled by default for memory savings
     cfg.cache_similarity_threshold = float(getattr(args, "rabbit_cache_threshold", 0.98))
     cfg.memory_safety_margin = float(getattr(args, "rabbit_memory_safety", 0.15))
+
+    # Gradient checkpointing for activation memory reduction (enabled by default)
+    cfg.enable_checkpointing = bool(getattr(args, "rabbit_enable_checkpointing", True))
+    cfg.checkpoint_every_n_blocks = max(1, int(getattr(args, "rabbit_checkpoint_interval", 1)))
+
+    # Latent offloading between stages (enabled by default for small devices)
+    cfg.enable_latent_offload = bool(getattr(args, "rabbit_enable_latent_offload", True))
+    cfg.offload_latents_every_n_blocks = max(1, int(getattr(args, "rabbit_latent_offload_interval", 5)))
 
     resident_str = getattr(args, "rabbit_resident_plan", None)
     cfg.resident_plan = parse_resident_plan(resident_str, transformer)

@@ -4,6 +4,7 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -679,7 +680,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     img, txt = decision.outputs  # type: ignore[misc]
                     continue
 
-            block_outputs = block(*double_block_args)
+            # Use gradient checkpointing to reduce activation memory
+            should_checkpoint = (runtime is not None and
+                               getattr(runtime.config, 'enable_checkpointing', False) and
+                               idx % getattr(runtime.config, 'checkpoint_every_n_blocks', 1) == 0)
+
+            if should_checkpoint:
+                # Checkpoint to save activation memory (trades compute for memory)
+                block_outputs = checkpoint(block, *double_block_args, use_reentrant=False)
+            else:
+                block_outputs = block(*double_block_args)
             if isinstance(block_outputs, tuple):
                 new_img, new_txt = block_outputs
             else:
@@ -721,7 +731,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         (x,) = decision.outputs  # type: ignore[misc]
                         continue
 
-                block_output = block(*single_block_args)
+                # Use gradient checkpointing to reduce activation memory
+                should_checkpoint = (runtime is not None and
+                                   getattr(runtime.config, 'enable_checkpointing', False) and
+                                   idx % getattr(runtime.config, 'checkpoint_every_n_blocks', 1) == 0)
+
+                if should_checkpoint:
+                    # Checkpoint to save activation memory (trades compute for memory)
+                    block_output = checkpoint(block, *single_block_args, use_reentrant=False)
+                else:
+                    block_output = block(*single_block_args)
                 single_outputs = (
                     block_output
                     if isinstance(block_output, tuple)

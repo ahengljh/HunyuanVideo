@@ -503,6 +503,29 @@ class RabbitRuntimeManager:
             self.logger.info(f"[Rabbit] Block EXECUTED: {stage}[{index}] - "
                            f"delta={delta:.4e}, importance={state.ema_importance:.4e}")
 
+        # Periodically offload outputs (latents) to CPU to reduce peak memory
+        # This is especially helpful between stages and every N blocks
+        if getattr(self.config, 'enable_latent_offload', False):
+            offload_interval = getattr(self.config, 'offload_latents_every_n_blocks', 5)
+            if index > 0 and index % offload_interval == 0:
+                # Move outputs to CPU temporarily, will be loaded back when needed
+                outputs_cpu = tuple(
+                    out.cpu() if isinstance(out, torch.Tensor) and out.is_cuda else out
+                    for out in outputs
+                )
+                # Clear GPU cache and force cleanup
+                if hasattr(torch.cuda, 'synchronize'):
+                    torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                # Also trigger Python garbage collection for CPU memory
+                import gc
+                gc.collect()
+                # Move back to GPU for next block
+                outputs = tuple(
+                    out.to(self.device, non_blocking=True) if isinstance(out, torch.Tensor) else out
+                    for out in outputs_cpu
+                )
+
         # Smart offloading decision
         should_retain = self._maybe_promote_hot_block(stage, index, block)
 
