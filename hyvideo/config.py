@@ -12,6 +12,7 @@ def parse_args(namespace=None):
     parser = add_denoise_schedule_args(parser)
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
+    parser = add_rabbit_video_args(parser)  # Add RabbitVideo args
 
     args = parser.parse_args(namespace=namespace)
     args = sanity_check_args(args)
@@ -192,8 +193,10 @@ def add_denoise_schedule_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--flow-reverse",
         action="store_true",
+        default=True,  # Set to True by default for proper denoising
         help="If reverse, learning/sampling from t=1 -> t=0.",
     )
+    group.set_defaults(flow_reverse=True)  # Ensure default is True
     group.add_argument(
         "--flow-solver",
         type=str,
@@ -337,7 +340,7 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "--neg-prompt", type=str, default=None, help="Negative prompt for sampling."
     )
     group.add_argument(
-        "--cfg-scale", type=float, default=1.0, help="Classifier free guidance scale."
+        "--cfg-scale", type=float, default=6.0, help="Classifier free guidance scale."
     )
     group.add_argument(
         "--embedded-cfg-scale",
@@ -376,6 +379,85 @@ def add_parallel_args(parser: argparse.ArgumentParser):
         type=int,
         default=1,
         help="Ulysses degree.",
+    )
+
+    return parser
+
+
+def add_rabbit_video_args(parser: argparse.ArgumentParser):
+    """Add RabbitVideo memory optimization arguments."""
+    group = parser.add_argument_group(title="RabbitVideo memory optimization args")
+
+    # Main control
+    group.add_argument(
+        "--rabbit-mode",
+        action="store_true",
+        help="Enable RabbitVideo memory optimizations for running on consumer GPUs (24GB target)."
+    )
+
+    # Memory targets
+    group.add_argument(
+        "--rabbit-target-memory",
+        type=float,
+        default=24.0,
+        help="Target GPU memory usage in GB (default: 24.0 for RTX 4090)."
+    )
+    group.add_argument(
+        "--rabbit-offload-threshold",
+        type=float,
+        default=20.0,
+        help="Start offloading when GPU memory exceeds this threshold in GB."
+    )
+
+    # Offloading options
+    group.add_argument(
+        "--rabbit-enable-offloading",
+        action="store_true",
+        default=True,
+        help="Enable CPU offloading of transformer blocks."
+    )
+    group.add_argument(
+        "--rabbit-prefetch-blocks",
+        type=int,
+        default=2,
+        help="Number of blocks to prefetch ahead of current execution."
+    )
+    group.add_argument(
+        "--rabbit-aggressive-offload",
+        action="store_true",
+        help="Enable aggressive offloading mode (more memory savings, slower)."
+    )
+
+    # Temporal caching
+    group.add_argument(
+        "--rabbit-enable-caching",
+        action="store_true",
+        default=True,
+        help="Enable temporal redundancy caching for similar frames."
+    )
+    group.add_argument(
+        "--rabbit-cache-threshold",
+        type=float,
+        default=0.95,
+        help="Similarity threshold for frame caching (0.0-1.0)."
+    )
+
+    # Advanced options
+    group.add_argument(
+        "--rabbit-gradient-checkpointing",
+        action="store_true",
+        default=True,
+        help="Enable gradient checkpointing for memory efficiency."
+    )
+    group.add_argument(
+        "--rabbit-profile",
+        action="store_true",
+        help="Enable detailed memory profiling and save logs."
+    )
+    group.add_argument(
+        "--rabbit-debug",
+        action="store_true",
+        help="Enable debug mode with verbose logging."
     )
 
     return parser

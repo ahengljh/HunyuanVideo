@@ -18,6 +18,9 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.modules.fp8_optimization import convert_fp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
+from hyvideo.rabbit import RabbitMemoryManager
+from hyvideo.rabbit.memory_manager import MemoryConfig
+from hyvideo.rabbit.model_wrapper import optimize_model_for_rabbit
 
 try:
     import xfuser
@@ -140,6 +143,38 @@ class Inference(object):
         self.logger = logger
         self.parallel_args = parallel_args
 
+        # Initialize RabbitVideo if enabled
+        self.rabbit_manager = None
+        if hasattr(args, 'rabbit_mode') and args.rabbit_mode:
+            self._init_rabbit_video(args)
+
+    def _init_rabbit_video(self, args):
+        """Initialize RabbitVideo memory management."""
+        config = MemoryConfig(
+            target_memory_gb=args.rabbit_target_memory if hasattr(args, 'rabbit_target_memory') else 24.0,
+            offload_threshold_gb=args.rabbit_offload_threshold if hasattr(args, 'rabbit_offload_threshold') else 20.0,
+            prefetch_blocks=args.rabbit_prefetch_blocks if hasattr(args, 'rabbit_prefetch_blocks') else 2,
+            cache_similarity_threshold=args.rabbit_cache_threshold if hasattr(args, 'rabbit_cache_threshold') else 0.95,
+            enable_profiling=args.rabbit_profile if hasattr(args, 'rabbit_profile') else False,
+            enable_offloading=args.rabbit_enable_offloading if hasattr(args, 'rabbit_enable_offloading') else True,
+            enable_caching=args.rabbit_enable_caching if hasattr(args, 'rabbit_enable_caching') else True,
+            enable_gradient_checkpointing=args.rabbit_gradient_checkpointing if hasattr(args, 'rabbit_gradient_checkpointing') else True,
+            aggressive_mode=args.rabbit_aggressive_offload if hasattr(args, 'rabbit_aggressive_offload') else False,
+            debug_mode=args.rabbit_debug if hasattr(args, 'rabbit_debug') else False,
+        )
+
+        self.rabbit_manager = RabbitMemoryManager(config)
+
+        # Initialize with the model
+        if self.model is not None:
+            self.rabbit_manager.initialize(self.model, {
+                'model_name': args.model if hasattr(args, 'model') else 'HYVideo',
+                'precision': args.precision if hasattr(args, 'precision') else 'bf16',
+            })
+
+        if self.logger:
+            self.logger.info("RabbitVideo memory management initialized")
+
     @classmethod
     def from_pretrained(cls, pretrained_model_path, args, device=None, **kwargs):
         """
@@ -202,6 +237,29 @@ class Inference(object):
         model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
+
+        # Apply RabbitVideo optimizations if enabled
+        rabbit_manager = None
+        if hasattr(args, 'rabbit_mode') and args.rabbit_mode:
+            config = MemoryConfig(
+                target_memory_gb=args.rabbit_target_memory if hasattr(args, 'rabbit_target_memory') else 24.0,
+                offload_threshold_gb=args.rabbit_offload_threshold if hasattr(args, 'rabbit_offload_threshold') else 20.0,
+                prefetch_blocks=args.rabbit_prefetch_blocks if hasattr(args, 'rabbit_prefetch_blocks') else 2,
+                cache_similarity_threshold=args.rabbit_cache_threshold if hasattr(args, 'rabbit_cache_threshold') else 0.95,
+                enable_profiling=args.rabbit_profile if hasattr(args, 'rabbit_profile') else False,
+                enable_offloading=args.rabbit_enable_offloading if hasattr(args, 'rabbit_enable_offloading') else True,
+                enable_caching=args.rabbit_enable_caching if hasattr(args, 'rabbit_enable_caching') else True,
+                enable_gradient_checkpointing=args.rabbit_gradient_checkpointing if hasattr(args, 'rabbit_gradient_checkpointing') else True,
+                aggressive_mode=args.rabbit_aggressive_offload if hasattr(args, 'rabbit_aggressive_offload') else False,
+                debug_mode=args.rabbit_debug if hasattr(args, 'rabbit_debug') else False,
+            )
+            rabbit_manager = RabbitMemoryManager(config)
+            rabbit_manager.initialize(model, {
+                'model_name': args.model,
+                'precision': args.precision,
+            })
+            model = optimize_model_for_rabbit(model, rabbit_manager)
+            logger.info("RabbitVideo optimizations applied to model")
 
         # ============================= Build extra models ========================
         # VAE
