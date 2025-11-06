@@ -455,6 +455,11 @@ def add_rabbit_video_args(parser: argparse.ArgumentParser):
         help="Enable detailed memory profiling and save logs."
     )
     group.add_argument(
+        "--aggressive-cache-clear",
+        action="store_true",
+        help="Aggressively clear CUDA cache every 5 steps to reduce reserved memory (may slow down)."
+    )
+    group.add_argument(
         "--rabbit-debug",
         action="store_true",
         help="Enable debug mode with verbose logging."

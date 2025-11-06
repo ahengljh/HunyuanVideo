@@ -1043,6 +1043,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                 )[0]
 
+                # Aggressively clear cache every few steps to reduce reserved memory
+                if i % 5 == 0 and hasattr(self.args, 'aggressive_cache_clear') and self.args.aggressive_cache_clear:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
