@@ -962,6 +962,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         if mem_profiler:
             mem_profiler.set_phase("denoising_loop")
             mem_profiler.log_allocated_tensors(tag="before_denoising_loop", top_n=20)
+            # Print explanation of memory management on first detailed snapshot
+            mem_profiler.print_memory_explanation()
 
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
