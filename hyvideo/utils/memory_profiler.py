@@ -41,6 +41,10 @@ class MemoryProfiler:
         self.active_components = set()
         self.component_start_memory = {}
 
+        # Reserved memory tracking
+        self._peak_reserved_gb = 0
+        self._peak_reserved_step = 0
+
         # Real-time monitoring thread
         self.monitoring = False
         self.monitor_thread = None
@@ -66,9 +70,16 @@ class MemoryProfiler:
         while self.monitoring:
             if torch.cuda.is_available():
                 memory_gb = torch.cuda.memory_allocated() / 1024**3
+                reserved_gb = torch.cuda.memory_reserved() / 1024**3
+
+                # Track peak reserved
+                if reserved_gb > self._peak_reserved_gb:
+                    self._peak_reserved_gb = reserved_gb
+
                 self.memory_timeline.append({
                     'timestamp': time.time() - self.start_time,
                     'memory_gb': memory_gb,
+                    'reserved_gb': reserved_gb,
                     'phase': self.current_phase
                 })
             time.sleep(self.monitor_interval)
@@ -255,6 +266,22 @@ class MemoryProfiler:
         print(f"Current Memory: {summary['current_memory_gb']:.2f} GB")
         print(f"Total Duration: {summary['total_duration']:.2f} seconds")
 
+        # Show reserved memory info if tracked
+        if hasattr(self, '_peak_reserved_gb'):
+            mem_info = self.get_gpu_memory_info()
+            current_reserved = mem_info.get('reserved_gb', 0)
+            current_allocated = mem_info.get('allocated_gb', 0)
+            cache_gb = current_reserved - current_allocated
+            print(f"\nReserved Memory Analysis:")
+            print(f"  Peak Reserved: {self._peak_reserved_gb:.2f} GB (at step {self._peak_reserved_step})")
+            print(f"  Current Reserved: {current_reserved:.2f} GB")
+            print(f"  Current Allocated: {current_allocated:.2f} GB")
+            print(f"  Cached (wasted): {cache_gb:.2f} GB")
+            if cache_gb > 10:
+                print(f"  ⚠️  WARNING: {cache_gb:.2f} GB reserved but unused!")
+                print(f"      PyTorch allocated this during peak usage and won't release it.")
+                print(f"      This is NORMAL PyTorch behavior - not a memory leak.")
+
         if analysis.get('offload_candidates'):
             print("\nTop Offloading Candidates:")
             for candidate in analysis['offload_candidates'][:5]:
@@ -423,12 +450,28 @@ class MemoryProfiler:
 
         mem_info = self.get_gpu_memory_info()
         elapsed = time.time() - self.start_time
+        allocated = mem_info.get('allocated_gb', 0)
+        reserved = mem_info.get('reserved_gb', 0)
+
+        # Track peak reserved memory
+        if not hasattr(self, '_peak_reserved_gb'):
+            self._peak_reserved_gb = reserved
+            self._peak_reserved_step = step
+        elif reserved > self._peak_reserved_gb:
+            self._peak_reserved_gb = reserved
+            self._peak_reserved_step = step
 
         # Create compact log entry
         log_msg = f"[RabbitVideo] Step {step:3d}/{total_steps} | "
-        log_msg += f"Mem: {mem_info.get('allocated_gb', 0):5.2f}GB | "
-        log_msg += f"Reserved: {mem_info.get('reserved_gb', 0):5.2f}GB | "
-        log_msg += f"Time: {elapsed:6.1f}s"
+        log_msg += f"Mem: {allocated:5.2f}GB | "
+        log_msg += f"Reserved: {reserved:5.2f}GB"
+
+        # Show cache size and warn if excessive
+        cache_gb = reserved - allocated
+        if cache_gb > 10.0:  # More than 10GB cached
+            log_msg += f" | Cache: {cache_gb:5.2f}GB (HIGH!)"
+
+        log_msg += f" | Time: {elapsed:6.1f}s"
 
         if extra_info:
             for key, value in extra_info.items():
@@ -443,6 +486,7 @@ class MemoryProfiler:
             'total_steps': total_steps,
             'phase': f"denoising_step_{step}",
             'memory_info': mem_info,
+            'cache_gb': cache_gb,
             'extra_info': extra_info or {}
         }
         self.memory_timeline.append(timestep_data)
