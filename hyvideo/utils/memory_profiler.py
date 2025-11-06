@@ -367,7 +367,12 @@ class MemoryProfiler:
         # Log memory breakdown
         print(f"Memory Breakdown:")
         print(f"  Total Tracked Tensors: {len(tensor_info):,}")
-        print(f"  Total Tracked Memory: {tracked_gb:.2f} GB ({tracked_gb/allocated_gb*100:.1f}% of allocated)")
+
+        if allocated_gb > 0:
+            print(f"  Total Tracked Memory: {tracked_gb:.2f} GB ({tracked_gb/allocated_gb*100:.1f}% of allocated)")
+        else:
+            print(f"  Total Tracked Memory: {tracked_gb:.2f} GB (no memory allocated yet)")
+
         print(f"  Parameters (requires_grad=True): {param_memory_mb/1024:.2f} GB ({len([t for t in tensor_info if t['requires_grad']]):,} tensors)")
         print(f"  Activations (requires_grad=False): {activation_memory_mb/1024:.2f} GB ({len([t for t in tensor_info if not t['requires_grad']]):,} tensors)")
         if untracked_gb > 0.1:  # Only show if significant
@@ -389,8 +394,16 @@ class MemoryProfiler:
         print(f"{'-'*80}")
         remaining_tensors = len(tensor_info) - top_n
         remaining_memory_gb = (total_tracked_mb - top_n_memory) / 1024
-        print(f"Top {top_n} tensors: {top_n_memory/1024:.2f} GB ({top_n_memory/total_tracked_mb*100:.1f}% of tracked)")
-        print(f"Remaining {remaining_tensors:,} tensors: {remaining_memory_gb:.2f} GB ({remaining_memory_gb/tracked_gb*100:.1f}% of tracked)")
+
+        if total_tracked_mb > 0:
+            print(f"Top {top_n} tensors: {top_n_memory/1024:.2f} GB ({top_n_memory/total_tracked_mb*100:.1f}% of tracked)")
+            if tracked_gb > 0:
+                print(f"Remaining {remaining_tensors:,} tensors: {remaining_memory_gb:.2f} GB ({remaining_memory_gb/tracked_gb*100:.1f}% of tracked)")
+            else:
+                print(f"Remaining {remaining_tensors:,} tensors: {remaining_memory_gb:.2f} GB")
+        else:
+            print(f"No tensors allocated yet")
+
         print(f"{'='*80}\n")
 
         # Save snapshot to timeline
