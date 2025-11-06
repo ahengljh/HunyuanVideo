@@ -294,6 +294,12 @@ class TextEncoder(nn.Module):
             return_texts (bool): Whether to return the decoded texts. Defaults to False.
         """
         device = self.model.device if device is None else device
+
+        # Smart device management: if model is on CPU but target device is GPU, temporarily move to GPU
+        model_was_on_cpu = str(self.model.device) == 'cpu' and str(device).startswith('cuda')
+        if model_was_on_cpu:
+            self.model = self.model.to(device)
+
         use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
         hidden_state_skip_layer = use_default(
             hidden_state_skip_layer, self.hidden_state_skip_layer
@@ -331,11 +337,20 @@ class TextEncoder(nn.Module):
                     attention_mask[:, crop_start:] if use_attention_mask else None
                 )
 
+        # Move embeddings to the target device (outputs are on model device)
+        result_last_hidden_state = last_hidden_state.to(device) if last_hidden_state.device != device else last_hidden_state
+        result_attention_mask = attention_mask.to(device) if attention_mask is not None and attention_mask.device != device else attention_mask
+
+        # Move model back to CPU if it was originally there (for memory efficiency)
+        if model_was_on_cpu:
+            self.model = self.model.to('cpu')
+            torch.cuda.empty_cache()  # Free GPU memory immediately
+
         if output_hidden_states:
             return TextEncoderModelOutput(
-                last_hidden_state, attention_mask, outputs.hidden_states
+                result_last_hidden_state, result_attention_mask, outputs.hidden_states
             )
-        return TextEncoderModelOutput(last_hidden_state, attention_mask)
+        return TextEncoderModelOutput(result_last_hidden_state, result_attention_mask)
 
     def forward(
         self,

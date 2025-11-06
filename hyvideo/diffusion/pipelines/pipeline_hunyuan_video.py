@@ -1103,6 +1103,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if mem_profiler:
                 mem_profiler.set_phase("vae_decode")
 
+            # Smart device management: move VAE to GPU if needed
+            vae_was_on_cpu = str(self.vae.device).startswith('cpu')
+            if vae_was_on_cpu:
+                self.vae = self.vae.to(device)
+
             with torch.autocast(
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
@@ -1115,6 +1120,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     image = self.vae.decode(
                         latents, return_dict=False, generator=generator
                     )[0]
+
+            # Move VAE back to CPU if it was originally there
+            if vae_was_on_cpu:
+                self.vae = self.vae.to('cpu')
+                torch.cuda.empty_cache()
 
             # Log memory after VAE decode
             if mem_profiler:

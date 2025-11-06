@@ -280,15 +280,23 @@ class Inference(object):
             logger.info("RabbitVideo optimizations applied to model")
 
         # ============================= Build extra models ========================
-        # VAE
+        # VAE - Load to CPU first if smart loading enabled to prevent peak memory
         if mem_profiler:
             mem_profiler.set_phase("loading_vae")
+
+        # Smart loading: load VAE to CPU initially to avoid peak memory
+        # It will be moved to GPU only when needed (during encode/decode)
+        smart_loading = hasattr(args, 'rabbit_mode') and args.rabbit_mode
+        vae_device = "cpu" if smart_loading else (device if not args.use_cpu_offload else "cpu")
+
+        if smart_loading:
+            logger.info("Smart loading: Loading VAE to CPU to prevent peak memory")
 
         vae, _, s_ratio, t_ratio = load_vae(
             args.vae,
             args.vae_precision,
             logger=logger,
-            device=device if not args.use_cpu_offload else "cpu",
+            device=vae_device,
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
 
@@ -324,6 +332,12 @@ class Inference(object):
         if mem_profiler:
             mem_profiler.set_phase("loading_text_encoder")
 
+        # Smart loading: load text encoders to CPU initially
+        text_encoder_device = "cpu" if smart_loading else (device if not args.use_cpu_offload else "cpu")
+
+        if smart_loading:
+            logger.info("Smart loading: Loading text encoders to CPU to prevent peak memory")
+
         text_encoder = TextEncoder(
             text_encoder_type=args.text_encoder,
             max_length=max_length,
@@ -335,7 +349,7 @@ class Inference(object):
             apply_final_norm=args.apply_final_norm,
             reproduce=args.reproduce,
             logger=logger,
-            device=device if not args.use_cpu_offload else "cpu",
+            device=text_encoder_device,
         )
         text_encoder_2 = None
         if args.text_encoder_2 is not None:
@@ -346,7 +360,7 @@ class Inference(object):
                 tokenizer_type=args.tokenizer_2,
                 reproduce=args.reproduce,
                 logger=logger,
-                device=device if not args.use_cpu_offload else "cpu",
+                device=text_encoder_device,
             )
 
         if mem_profiler:
