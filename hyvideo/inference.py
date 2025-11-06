@@ -21,6 +21,7 @@ from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 from hyvideo.rabbit import RabbitMemoryManager
 from hyvideo.rabbit.memory_manager import MemoryConfig
 from hyvideo.rabbit.model_wrapper import optimize_model_for_rabbit
+from hyvideo.utils.memory_profiler import MemoryProfiler, set_memory_profiler
 
 try:
     import xfuser
@@ -217,11 +218,24 @@ class Inference(object):
 
         # ======================== Get the args path =============================
 
+        # Initialize memory profiler if debugging is enabled
+        mem_profiler = None
+        if hasattr(args, 'rabbit_debug') and args.rabbit_debug:
+            mem_profiler = MemoryProfiler(enable_profiling=True)
+            set_memory_profiler(mem_profiler)
+            mem_profiler.start_monitoring()
+            mem_profiler.set_phase("initialization")
+            mem_profiler.log_allocated_tensors(tag="before_model_loading", top_n=10)
+            logger.info("Memory profiler initialized and monitoring started")
+
         # Disable gradient
         torch.set_grad_enabled(False)
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
+        if mem_profiler:
+            mem_profiler.set_phase("loading_transformer")
+
         factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
         in_channels = args.latent_channels
         out_channels = args.latent_channels
@@ -237,6 +251,10 @@ class Inference(object):
         model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
+
+        if mem_profiler:
+            mem_profiler.log_model_memory(model, "Transformer")
+            mem_profiler.log_allocated_tensors(tag="after_transformer_loaded", top_n=15)
 
         # Apply RabbitVideo optimizations if enabled
         rabbit_manager = None
@@ -263,6 +281,9 @@ class Inference(object):
 
         # ============================= Build extra models ========================
         # VAE
+        if mem_profiler:
+            mem_profiler.set_phase("loading_vae")
+
         vae, _, s_ratio, t_ratio = load_vae(
             args.vae,
             args.vae_precision,
@@ -270,6 +291,10 @@ class Inference(object):
             device=device if not args.use_cpu_offload else "cpu",
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
+
+        if mem_profiler:
+            mem_profiler.log_model_memory(vae, "VAE")
+            mem_profiler.log_allocated_tensors(tag="after_vae_loaded", top_n=15)
 
         # Text encoder
         if args.prompt_template_video is not None:
@@ -296,6 +321,9 @@ class Inference(object):
             else None
         )
 
+        if mem_profiler:
+            mem_profiler.set_phase("loading_text_encoder")
+
         text_encoder = TextEncoder(
             text_encoder_type=args.text_encoder,
             max_length=max_length,
@@ -320,6 +348,14 @@ class Inference(object):
                 logger=logger,
                 device=device if not args.use_cpu_offload else "cpu",
             )
+
+        if mem_profiler:
+            if hasattr(text_encoder, 'model') and text_encoder.model is not None:
+                mem_profiler.log_model_memory(text_encoder.model, "TextEncoder")
+            if text_encoder_2 and hasattr(text_encoder_2, 'model') and text_encoder_2.model is not None:
+                mem_profiler.log_model_memory(text_encoder_2.model, "TextEncoder2")
+            mem_profiler.log_allocated_tensors(tag="after_all_models_loaded", top_n=20)
+            mem_profiler.set_phase("models_loaded_complete")
 
         return cls(
             args=args,

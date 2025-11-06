@@ -283,6 +283,142 @@ class MemoryProfiler:
             'total_gb': torch.cuda.get_device_properties(0).total_memory / 1024**3
         }
 
+    def log_allocated_tensors(self, tag: str = "snapshot", top_n: int = 20):
+        """Log all allocated tensors on GPU with detailed information."""
+        if not self.enable_profiling or not torch.cuda.is_available():
+            return
+
+        print(f"\n{'='*80}")
+        print(f"[RabbitVideo] GPU Memory Snapshot: {tag}")
+        print(f"Time: {time.time() - self.start_time:.2f}s | Phase: {self.current_phase}")
+        print(f"{'='*80}")
+
+        # Get GPU memory info
+        mem_info = self.get_gpu_memory_info()
+        print(f"Total GPU Memory: {mem_info.get('total_gb', 0):.2f} GB")
+        print(f"Allocated: {mem_info.get('allocated_gb', 0):.2f} GB")
+        print(f"Reserved: {mem_info.get('reserved_gb', 0):.2f} GB")
+        print(f"Free: {mem_info.get('free_gb', 0):.2f} GB")
+        print(f"{'-'*80}")
+
+        # Collect all tensors
+        tensor_info = []
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj):
+                    if obj.is_cuda:
+                        memory_mb = obj.element_size() * obj.numel() / (1024 * 1024)
+                        tensor_info.append({
+                            'shape': tuple(obj.shape),
+                            'dtype': str(obj.dtype),
+                            'memory_mb': memory_mb,
+                            'device': str(obj.device),
+                            'requires_grad': obj.requires_grad
+                        })
+            except Exception:
+                pass
+
+        # Sort by memory usage
+        tensor_info.sort(key=lambda x: x['memory_mb'], reverse=True)
+
+        # Log top N tensors
+        print(f"Top {top_n} Tensors by Memory Usage:")
+        print(f"{'Shape':<30} {'DType':<15} {'Memory (MB)':<15} {'Grad':<8} {'Device'}")
+        print(f"{'-'*80}")
+
+        total_tensor_memory = 0
+        for i, info in enumerate(tensor_info[:top_n]):
+            total_tensor_memory += info['memory_mb']
+            shape_str = str(info['shape'])[:28]
+            dtype_str = info['dtype'].replace('torch.', '')[:13]
+            print(f"{shape_str:<30} {dtype_str:<15} {info['memory_mb']:>10.2f} MB   {str(info['requires_grad']):<8} {info['device']}")
+
+        print(f"{'-'*80}")
+        print(f"Total tracked tensors: {len(tensor_info)}")
+        print(f"Memory in top {top_n}: {total_tensor_memory:.2f} MB ({total_tensor_memory/1024:.2f} GB)")
+        print(f"{'='*80}\n")
+
+        # Save snapshot to timeline
+        snapshot_data = {
+            'timestamp': time.time() - self.start_time,
+            'tag': tag,
+            'phase': self.current_phase,
+            'memory_info': mem_info,
+            'top_tensors': tensor_info[:top_n],
+            'total_tensors': len(tensor_info)
+        }
+
+        # Store in memory timeline with special marker
+        self.memory_timeline.append(snapshot_data)
+
+    def log_model_memory(self, model, model_name: str):
+        """Log memory usage of a model and its parameters."""
+        if not self.enable_profiling or model is None:
+            return
+
+        print(f"\n[RabbitVideo] Model Memory: {model_name}")
+        print(f"{'-'*60}")
+
+        total_params = 0
+        total_memory_mb = 0
+        param_memory = {}
+
+        for name, param in model.named_parameters():
+            if param is not None:
+                num_params = param.numel()
+                memory_mb = param.element_size() * num_params / (1024 * 1024)
+                total_params += num_params
+                total_memory_mb += memory_mb
+
+                # Group by module
+                module_name = name.split('.')[0] if '.' in name else name
+                if module_name not in param_memory:
+                    param_memory[module_name] = {'params': 0, 'memory_mb': 0}
+                param_memory[module_name]['params'] += num_params
+                param_memory[module_name]['memory_mb'] += memory_mb
+
+        # Print by module
+        print(f"{'Module':<30} {'Parameters':<20} {'Memory (MB)'}")
+        print(f"{'-'*60}")
+        for module_name, stats in sorted(param_memory.items(), key=lambda x: x[1]['memory_mb'], reverse=True)[:10]:
+            print(f"{module_name[:28]:<30} {stats['params']:>15,}      {stats['memory_mb']:>10.2f}")
+
+        print(f"{'-'*60}")
+        print(f"Total Parameters: {total_params:,}")
+        print(f"Total Model Memory: {total_memory_mb:.2f} MB ({total_memory_mb/1024:.2f} GB)")
+        print(f"{'-'*60}\n")
+
+    def log_timestep_memory(self, step: int, total_steps: int, extra_info: dict = None):
+        """Log memory at each denoising timestep with detailed breakdown."""
+        if not self.enable_profiling:
+            return
+
+        mem_info = self.get_gpu_memory_info()
+        elapsed = time.time() - self.start_time
+
+        # Create compact log entry
+        log_msg = f"[RabbitVideo] Step {step:3d}/{total_steps} | "
+        log_msg += f"Mem: {mem_info.get('allocated_gb', 0):5.2f}GB | "
+        log_msg += f"Reserved: {mem_info.get('reserved_gb', 0):5.2f}GB | "
+        log_msg += f"Time: {elapsed:6.1f}s"
+
+        if extra_info:
+            for key, value in extra_info.items():
+                log_msg += f" | {key}: {value}"
+
+        print(log_msg)
+
+        # Store detailed timestep info
+        timestep_data = {
+            'timestamp': elapsed,
+            'step': step,
+            'total_steps': total_steps,
+            'phase': f"denoising_step_{step}",
+            'memory_info': mem_info,
+            'extra_info': extra_info or {}
+        }
+        self.memory_timeline.append(timestep_data)
+
     @staticmethod
     def force_cleanup():
         """Force garbage collection and empty CUDA cache."""

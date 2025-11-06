@@ -47,6 +47,7 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
+from ...utils.memory_profiler import get_memory_profiler
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -956,11 +957,25 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # Get memory profiler if available
+        mem_profiler = get_memory_profiler()
+        if mem_profiler:
+            mem_profiler.set_phase("denoising_loop")
+            mem_profiler.log_allocated_tensors(tag="before_denoising_loop", top_n=20)
+
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                # Log memory at each timestep
+                if mem_profiler:
+                    extra_info = {
+                        'latent_shape': str(latents.shape),
+                        'timestep': float(t.item()) if hasattr(t, 'item') else float(t)
+                    }
+                    mem_profiler.log_timestep_memory(i, len(timesteps), extra_info)
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1001,6 +1016,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     )[
                         "x"
                     ]
+
+                # Log detailed tensor snapshot every 5 steps or at the beginning
+                if mem_profiler and (i % 5 == 0 or i == 0):
+                    mem_profiler.log_allocated_tensors(tag=f"after_transformer_step_{i}", top_n=15)
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1044,6 +1063,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
+        # Log memory after denoising loop
+        if mem_profiler:
+            mem_profiler.set_phase("after_denoising")
+            mem_profiler.log_allocated_tensors(tag="after_denoising_loop", top_n=20)
+
         if not output_type == "latent":
             expand_temporal_dim = False
             if len(latents.shape) == 4:
@@ -1068,6 +1092,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             else:
                 latents = latents / self.vae.config.scaling_factor
 
+            # Log memory before VAE decode
+            if mem_profiler:
+                mem_profiler.set_phase("vae_decode")
+
             with torch.autocast(
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
@@ -1081,6 +1109,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         latents, return_dict=False, generator=generator
                     )[0]
 
+            # Log memory after VAE decode
+            if mem_profiler:
+                mem_profiler.log_allocated_tensors(tag="after_vae_decode", top_n=20)
+
             if expand_temporal_dim or image.shape[2] == 1:
                 image = image.squeeze(2)
 
@@ -1093,6 +1125,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         # Offload all models
         self.maybe_free_model_hooks()
+
+        # Save memory profile if profiling was enabled
+        if mem_profiler:
+            mem_profiler.set_phase("pipeline_complete")
+            mem_profiler.stop_monitoring()
+            mem_profiler.save_profile()
 
         if not return_dict:
             return image
