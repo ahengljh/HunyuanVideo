@@ -74,6 +74,17 @@ class OffloadManager:
         print(f"[RabbitVideo] OffloadManager initialized with {len(self.blocks)} blocks")
         self._print_memory_distribution()
 
+        # PROACTIVE offloading: immediately offload most blocks to prevent peak memory
+        # Only keep first few blocks on GPU, offload the rest
+        if self.aggressive_mode and len(self.blocks) > 0:
+            blocks_to_keep = max(2, len(self.blocks) // 10)  # Keep 10% or at least 2
+            print(f"[RabbitVideo] Aggressive mode: offloading {len(self.blocks) - blocks_to_keep} blocks to CPU immediately")
+            self._proactive_offload(blocks_to_keep)
+        elif len(self.blocks) > 4:  # Normal mode: keep 25% on GPU
+            blocks_to_keep = max(4, len(self.blocks) // 4)
+            print(f"[RabbitVideo] Proactive offloading: keeping {blocks_to_keep} blocks on GPU, offloading {len(self.blocks) - blocks_to_keep} to CPU")
+            self._proactive_offload(blocks_to_keep)
+
         # Start prefetch thread
         self._start_prefetch_thread()
 
@@ -81,6 +92,23 @@ class OffloadManager:
         """Check if module is a transformer block."""
         class_name = module.__class__.__name__
         return 'MMDoubleStreamBlock' in class_name or 'MMSingleStreamBlock' in class_name
+
+    def _proactive_offload(self, blocks_to_keep_on_gpu: int):
+        """Proactively offload blocks to CPU to prevent peak memory at initialization."""
+        # Keep first N blocks on GPU, offload the rest
+        gpu_blocks = list(self.blocks_on_gpu)
+
+        for block_idx in gpu_blocks[blocks_to_keep_on_gpu:]:
+            print(f"[RabbitVideo] Offloading block {block_idx} to CPU...", end='', flush=True)
+            success = self._move_block_to_cpu(block_idx)
+            if success:
+                print(" ✓")
+            else:
+                print(" ✗")
+
+        print(f"[RabbitVideo] Proactive offloading complete")
+        self._print_memory_distribution()
+        torch.cuda.empty_cache()  # Free up memory immediately
 
     def _calculate_module_memory(self, module: nn.Module) -> float:
         """Calculate memory usage of a module in bytes."""
