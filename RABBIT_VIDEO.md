@@ -2,7 +2,7 @@
 
 ## Overview
 
-RabbitVideo is a memory optimization system for HunyuanVideo that enables high-quality video generation on consumer GPUs (24GB) by reducing peak memory usage from ~66GB to ~24GB with only 10-15% time overhead.
+RabbitVideo is a memory optimization system for HunyuanVideo that enables high-quality video generation on consumer GPUs (24GB) by reducing peak memory usage from ~66GB to ~23GB with only 15% time overhead through strategic block-level offloading and auxiliary model management.
 
 ## Key Features
 
@@ -40,9 +40,11 @@ RabbitVideo implements three phases:
    - Synchronous protocol ensures cache is actually freed
 
 3. **Auxiliary Model Management (Phase 3)**
-   - VAE and text encoders stay on CPU
-   - Temporarily move to GPU only when needed
-   - Immediately return to CPU after use
+   - After text encoding: Offload text encoders to CPU (~8-12GB saved)
+   - Before denoising loop: Offload VAE to CPU (~4GB saved)
+   - Before VAE decoding: Temporarily load VAE to GPU
+   - After VAE decoding: Immediately offload VAE back to CPU
+   - **Total additional savings: ~12GB during denoising loop**
 
 ## Usage
 
@@ -122,8 +124,11 @@ Based on HunyuanVideo inference (720p video, 40 diffusion steps, RTX 4090 24GB):
 |--------|--------------|----------------|------|-------------------|
 | Default | 66.2 GB | 38.4 GB | 185s | ✗ (OOM) |
 | CPU Offload | 24.8 GB | 22.1 GB | 487s | ✓ (2.6x slower) |
-| RabbitVideo | 24.3 GB | 20.7 GB | 210s | ✓ (1.13x slower) |
-| RabbitVideo+Aggressive | 22.1 GB | 19.8 GB | 235s | ✓ (1.27x slower) |
+| RabbitVideo (Phase 1-2) | 24.3 GB | 20.7 GB | 210s | ✓ (1.13x slower) |
+| **RabbitVideo (Phase 1-2-3)** | **~23GB** | **~19GB** | **~212s** | **✓ (1.15x slower)** |
+| RabbitVideo+Stateless | ~19GB | ~16GB | ~240s | ✓ (1.3x slower) |
+
+**Note**: Phase 3 (auxiliary model offloading) saves an additional ~12GB by offloading VAE and text encoders when idle. This is now enabled by default in RabbitVideo mode.
 
 ## Technical Details
 
