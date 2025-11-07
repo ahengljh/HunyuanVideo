@@ -521,7 +521,8 @@ class HunyuanVideoSampler(Inference):
         device=0,
         logger=None,
         parallel_args=None,
-        rabbit_offloader=None
+        rabbit_offloader=None,
+        memory_monitor=None,
     ):
         super().__init__(
             args,
@@ -535,7 +536,8 @@ class HunyuanVideoSampler(Inference):
             device=device,
             logger=logger,
             parallel_args=parallel_args,
-            rabbit_offloader=rabbit_offloader
+            rabbit_offloader=rabbit_offloader,
+            memory_monitor=memory_monitor,
         )
 
         self.pipeline = self.load_diffusion_pipeline(
@@ -586,8 +588,14 @@ class HunyuanVideoSampler(Inference):
         )
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()
+            exec_device = torch.device("cpu")
         else:
             pipeline = pipeline.to(device)
+            exec_device = device if isinstance(device, torch.device) else torch.device(device)
+
+        # Diffusers normally sets `_execution_device` when moving the pipeline,
+        # but custom initialization paths here can skip that, so set it explicitly.
+        pipeline._execution_device = exec_device
 
         return pipeline
 
