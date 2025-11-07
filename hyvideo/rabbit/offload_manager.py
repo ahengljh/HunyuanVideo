@@ -202,7 +202,7 @@ class OffloadManager:
             return self._move_block_to_cpu(block_idx)
 
     def _move_block_to_gpu(self, block_idx: int) -> bool:
-        """Move a block from CPU to GPU."""
+        """Move a block from CPU to GPU SYNCHRONOUSLY."""
         if block_idx in self.blocks_on_gpu:
             return True
 
@@ -221,11 +221,17 @@ class OffloadManager:
             # Check if we need to free memory first
             block_memory = self.block_memory_size[block_idx]
             if self._get_current_gpu_memory() + block_memory > self.gpu_memory_limit:
+                # SYNCHRONOUSLY free memory BEFORE loading new block
+                print(f"[RabbitVideo] Memory {self._get_current_gpu_memory()/1024**3:.1f}GB > threshold, considering offloading")
                 self._free_gpu_memory(block_memory)
+                # Wait for all offloading to complete and free reserved memory
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                print(f"[RabbitVideo] After offload: {self._get_current_gpu_memory()/1024**3:.1f}GB")
 
-            # Move block to GPU (non-blocking for better performance)
-            with torch.cuda.stream(torch.cuda.Stream()):
-                block.to('cuda', non_blocking=True)
+            # Move block to GPU SYNCHRONOUSLY (blocking=True is default)
+            block.to('cuda')  # This is synchronous by default
+            torch.cuda.synchronize()  # Ensure transfer is complete
             self.block_devices[block_idx] = 'cuda'
 
             # Update tracking
@@ -245,7 +251,7 @@ class OffloadManager:
             self.blocks_in_transfer.discard(block_idx)
 
     def _move_block_to_cpu(self, block_idx: int) -> bool:
-        """Move a block from GPU to CPU."""
+        """Move a block from GPU to CPU SYNCHRONOUSLY."""
         if block_idx in self.blocks_on_cpu:
             return True
 
@@ -258,8 +264,10 @@ class OffloadManager:
             start_time = time.time()
             block = self.blocks[block_idx]
 
-            # Move block to CPU
+            # Move block to CPU SYNCHRONOUSLY
             block.to('cpu')
+            # Wait for transfer to complete and sync all CUDA operations
+            torch.cuda.synchronize()
             self.block_devices[block_idx] = 'cpu'
 
             # Update tracking
@@ -270,8 +278,9 @@ class OffloadManager:
             self.total_transfers += 1
             self.total_transfer_time += transfer_time
 
-            # Clear GPU cache
+            # CRITICAL: Clear GPU cache AND synchronize to actually free reserved memory
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Ensure cache is actually freed
 
             return True
 
@@ -285,7 +294,7 @@ class OffloadManager:
         return 0
 
     def _free_gpu_memory(self, required_memory: float):
-        """Free GPU memory by offloading blocks to CPU."""
+        """Free GPU memory by offloading blocks to CPU SYNCHRONOUSLY."""
         # Sort blocks by access frequency (least recently used first)
         gpu_blocks = list(self.blocks_on_gpu)
         gpu_blocks.sort(key=lambda x: (self.block_access_counts[x],
@@ -297,8 +306,13 @@ class OffloadManager:
                 break
 
             if block_idx not in self.blocks_in_transfer:
-                self._move_block_to_cpu(block_idx)
+                self._move_block_to_cpu(block_idx)  # This is now synchronous
                 freed_memory += self.block_memory_size[block_idx]
+
+        # CRITICAL: Final synchronize to ensure ALL offloads completed
+        # and reserved memory is actually freed before returning
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     def offload_cold_blocks(self, current_block_idx: int):
         """Offload blocks that are unlikely to be used soon."""
