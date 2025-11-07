@@ -175,6 +175,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         text_encoder_2: Optional[TextEncoder] = None,
         progress_bar_config: Dict[str, Any] = None,
         args=None,
+        memory_monitor=None,
     ):
         super().__init__()
 
@@ -186,6 +187,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self._progress_bar_config.update(progress_bar_config)
 
         self.args = args
+        self.memory_monitor = memory_monitor  # Standalone memory monitoring
         # ==========================================================================================
 
         if (
@@ -835,7 +837,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        # Device detection: Handle RabbitVideo mode where transformer blocks may be on CPU
+        if dist.is_initialized():
+            device = torch.device(f"cuda:{dist.get_rank()}")
+        elif hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+            # In RabbitVideo mode, transformer blocks may be on CPU, so get device from VAE
+            try:
+                device = next(self.vae.parameters()).device
+            except StopIteration:
+                # Fallback to _execution_device if VAE has no parameters
+                device = self._execution_device
+        else:
+            device = self._execution_device
 
         # 3. Encode input prompt
         lora_scale = (
@@ -902,6 +915,19 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if prompt_mask_2 is not None:
                 prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
+        # RabbitVideo Phase 3: Offload text encoders to CPU after encoding
+        # Text encoders are no longer needed during the denoising loop
+        if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+            if self.text_encoder is not None:
+                self.text_encoder.to('cpu')
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            if self.text_encoder_2 is not None:
+                self.text_encoder_2.to('cpu')
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
         # 4. Prepare timesteps
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
@@ -952,15 +978,32 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
 
+        # RabbitVideo Phase 3: Offload VAE to CPU before denoising loop
+        # VAE is not needed during denoising and will be loaded back for decoding
+        if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+            if self.vae is not None:
+                self.vae.to('cpu')
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+
+        # Record memory before denoising loop
+        if self.memory_monitor is not None:
+            self.memory_monitor.record(blocks_on_gpu=0, current_block=-1)
 
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                # Record memory at each step
+                if self.memory_monitor is not None:
+                    self.memory_monitor.record(blocks_on_gpu=0, current_block=i)
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1068,6 +1111,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             else:
                 latents = latents / self.vae.config.scaling_factor
 
+            # RabbitVideo Phase 3: Temporarily move VAE to GPU for decoding
+            if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+                if self.vae is not None:
+                    self.vae.to(device)
+                    torch.cuda.synchronize()
+
             with torch.autocast(
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
@@ -1081,6 +1130,14 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         latents, return_dict=False, generator=generator
                     )[0]
 
+            # RabbitVideo Phase 3: Move VAE back to CPU after decoding
+            if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+                if self.vae is not None:
+                    self.vae.to('cpu')
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
             if expand_temporal_dim or image.shape[2] == 1:
                 image = image.squeeze(2)
 
@@ -1090,6 +1147,20 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().float()
+
+        # Record final memory state and save timeline
+        if self.memory_monitor is not None:
+            self.memory_monitor.record(blocks_on_gpu=0, current_block=-1)
+
+            # Save timeline if path is specified
+            if hasattr(self.args, 'save_memory_timeline') and self.args.save_memory_timeline:
+                self.memory_monitor.save_timeline(self.args.save_memory_timeline)
+                print(f"[Memory Timeline] Saved to: {self.args.save_memory_timeline}")
+
+                # Print summary
+                peak_alloc, peak_res = self.memory_monitor.get_peak_memory()
+                print(f"[Memory Timeline] Peak Allocated: {peak_alloc:.2f} GB")
+                print(f"[Memory Timeline] Peak Reserved: {peak_res:.2f} GB")
 
         # Offload all models
         self.maybe_free_model_hooks()
