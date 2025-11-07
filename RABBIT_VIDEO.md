@@ -65,6 +65,23 @@ python sample_video.py \
     --prompt "A cat walking in the garden"
 ```
 
+### Stateless Mode (Absolute Minimal Memory)
+
+For the absolute lowest memory usage via recomputation (load→execute→offload immediately, zero persistence):
+
+```bash
+python sample_video.py \
+    --rabbit-mode \
+    --rabbit-stateless \
+    --prompt "A cat walking in the garden"
+```
+
+**Key differences from default RabbitVideo:**
+- **Zero blocks persist on GPU** between executions
+- Each block is loaded, executed, and immediately offloaded
+- Slightly higher overhead (~5-10% more than default RabbitVideo)
+- Useful for extremely memory-constrained scenarios or when sharing GPU with other processes
+
 ### Debug Mode (Detailed Logging)
 
 To see detailed memory and block swapping logs:
@@ -93,6 +110,7 @@ python sample_video.py \
 |------|-------------|---------|
 | `--rabbit-mode` | Enable RabbitVideo block-level offloading | False |
 | `--rabbit-aggressive-offload` | Keep only 2 blocks on GPU (vs 5 default) | False |
+| `--rabbit-stateless` | Enable stateless mode (zero persistence, recomputation) | False |
 | `--rabbit-debug` | Enable detailed memory logging | False |
 | `--rabbit-save-timeline PATH` | Save memory timeline to JSON file | "" |
 

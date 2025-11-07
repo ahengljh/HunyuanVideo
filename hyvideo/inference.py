@@ -49,7 +49,12 @@ def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance)
     This function intercepts block execution to ensure each block is loaded
     to GPU before execution using the RabbitVideoOffloader, with aggressive
     cache clearing after each block.
+
+    In STATELESS mode, blocks are immediately offloaded after execution,
+    ensuring zero blocks persist on GPU between executions.
     """
+    stateless_mode = rabbit_offloader.stateless
+
     # Wrap double blocks
     for block_idx, block in enumerate(model.double_blocks):
         original_forward = block.forward
@@ -57,12 +62,19 @@ def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance)
         def make_wrapped_forward(orig_forward, idx):
             @functools.wraps(orig_forward)
             def wrapped_forward(*args, **kwargs):
-                # Ensure block is on GPU before execution
+                # Load: Ensure block is on GPU before execution
                 rabbit_offloader.ensure_block_on_gpu(idx)
-                # Execute block
+
+                # Execute: Run the block's forward pass
                 result = orig_forward(*args, **kwargs)
-                # AGGRESSIVE: Clear cache after block execution
+
+                # Offload: In stateless mode, immediately offload after execution
+                if stateless_mode:
+                    rabbit_offloader.offload_block_after_execution(idx)
+
+                # Clear cache aggressively
                 rabbit_offloader.clear_cache_after_block()
+
                 return result
             return wrapped_forward
 
@@ -77,19 +89,27 @@ def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance)
         def make_wrapped_forward(orig_forward, idx):
             @functools.wraps(orig_forward)
             def wrapped_forward(*args, **kwargs):
-                # Ensure block is on GPU before execution
+                # Load: Ensure block is on GPU before execution
                 rabbit_offloader.ensure_block_on_gpu(idx)
-                # Execute block
+
+                # Execute: Run the block's forward pass
                 result = orig_forward(*args, **kwargs)
-                # AGGRESSIVE: Clear cache after block execution
+
+                # Offload: In stateless mode, immediately offload after execution
+                if stateless_mode:
+                    rabbit_offloader.offload_block_after_execution(idx)
+
+                # Clear cache aggressively
                 rabbit_offloader.clear_cache_after_block()
+
                 return result
             return wrapped_forward
 
         block.forward = make_wrapped_forward(original_forward, global_block_idx)
 
     if logger_instance:
-        logger_instance.info(f"[RabbitVideo] Wrapped {len(model.double_blocks) + len(model.single_blocks)} transformer blocks")
+        mode_str = "STATELESS" if stateless_mode else "MINIMAL"
+        logger_instance.info(f"[RabbitVideo] Wrapped {len(model.double_blocks) + len(model.single_blocks)} transformer blocks ({mode_str} mode)")
 
 
 def parallelize_transformer(pipe):
@@ -342,9 +362,12 @@ class Inference(object):
             rabbit_debug = getattr(args, 'rabbit_debug', False)
             blocks_to_keep = DEFAULT_BLOCKS_TO_KEEP  # Always use minimal mode
 
+            rabbit_stateless = getattr(args, 'rabbit_stateless', False)
+
             logger.info(f"Initializing RabbitVideo with {blocks_to_keep} blocks on GPU (minimal memory mode)...")
             logger.info(f"Aggressive offload mode (deprecated, now always minimal): {rabbit_aggressive}")
             logger.info(f"Debug mode: {rabbit_debug}")
+            logger.info(f"Stateless mode (recomputation): {rabbit_stateless}")
 
             # Initialize RabbitVideo offloader
             rabbit_offloader = RabbitVideoOffloader(
@@ -352,7 +375,8 @@ class Inference(object):
                 device=device,
                 blocks_to_keep=blocks_to_keep,
                 debug=rabbit_debug,
-                logger=logger
+                logger=logger,
+                stateless=rabbit_stateless
             )
 
             # Phase 1: Smart initialization with proactive offloading

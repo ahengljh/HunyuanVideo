@@ -277,6 +277,11 @@ def add_inference_args(parser: argparse.ArgumentParser):
         default="",
         help="Path to save memory timeline JSON. Requires --rabbit-mode.",
     )
+    group.add_argument(
+        "--rabbit-stateless",
+        action="store_true",
+        help="Enable stateless mode: load→execute→offload immediately (zero persistence, absolute minimal memory). Requires --rabbit-mode.",
+    )
 
     # ======================== Inference general setting ========================
     group.add_argument(
@@ -426,6 +431,8 @@ def sanity_check_args(args):
         raise ValueError("--rabbit-debug requires --rabbit-mode to be enabled.")
     if args.rabbit_save_timeline and not args.rabbit_mode:
         raise ValueError("--rabbit-save-timeline requires --rabbit-mode to be enabled.")
+    if args.rabbit_stateless and not args.rabbit_mode:
+        raise ValueError("--rabbit-stateless requires --rabbit-mode to be enabled.")
     if args.rabbit_mode and args.use_cpu_offload:
         raise ValueError("Cannot use both --rabbit-mode and --use-cpu-offload. Choose one.")
 

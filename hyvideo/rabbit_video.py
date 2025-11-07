@@ -381,7 +381,8 @@ class RabbitVideoOffloader:
                  device: torch.device,
                  blocks_to_keep: int = 1,
                  debug: bool = False,
-                 logger=None):
+                 logger=None,
+                 stateless: bool = False):
         """
         Initialize RabbitVideo offloader.
 
@@ -391,12 +392,14 @@ class RabbitVideoOffloader:
             blocks_to_keep: Number of blocks to keep on GPU (default: 1 for minimal memory)
             debug: Enable debug logging
             logger: Loguru logger instance
+            stateless: Enable stateless mode (load→execute→offload immediately, zero persistence)
         """
         self.model = model
         self.device = device
         self.blocks_to_keep = blocks_to_keep
         self.debug = debug
         self.logger = logger
+        self.stateless = stateless
 
         # Extract blocks from model
         self.double_blocks = list(model.double_blocks)
@@ -417,20 +420,24 @@ class RabbitVideoOffloader:
         # Track current execution state
         self.current_step = 0
         self.total_steps = 0
-        self.prefetch_enabled = True  # Enable prefetching by default
+        # Disable prefetching in stateless mode
+        self.prefetch_enabled = not stateless
 
         if self.logger:
             self.logger.info(f"[RabbitVideo] Initialized with {self.num_blocks} blocks "
                            f"({len(self.double_blocks)} double + {len(self.single_blocks)} single)")
-            self.logger.info(f"[RabbitVideo] Will keep {self.blocks_to_keep} blocks on GPU (minimal memory mode)")
+            if self.stateless:
+                self.logger.info(f"[RabbitVideo] STATELESS MODE: Zero blocks persist on GPU (absolute minimal memory)")
+            else:
+                self.logger.info(f"[RabbitVideo] Will keep {self.blocks_to_keep} blocks on GPU (minimal memory mode)")
 
     def initialize_offloading(self):
         """
         Phase 1: Smart initialization with proactive offloading.
 
         Strategy:
-            - Keep only first block on GPU (minimal memory mode)
-            - Offload all other blocks to CPU
+            - Stateless mode: Offload ALL blocks to CPU (zero persistence)
+            - Minimal mode: Keep only first block on GPU
             - Calculate block sizes for accurate memory estimation
         """
         if self.logger:
@@ -445,14 +452,20 @@ class RabbitVideoOffloader:
         if self.logger:
             self.logger.info(f"[RabbitVideo] Average block size: {avg_size:.2f}GB")
 
-        # Decide which blocks to keep on GPU (first N blocks for initialization)
-        # For minimal memory, keep only 1 block
-        blocks_to_keep_on_gpu = set(range(min(self.blocks_to_keep, 1)))  # Keep only first block
-        blocks_to_offload = set(range(self.num_blocks)) - blocks_to_keep_on_gpu
-
-        if self.logger:
-            self.logger.info(f"[RabbitVideo] Keeping blocks {list(blocks_to_keep_on_gpu)} on GPU")
-            self.logger.info(f"[RabbitVideo] Offloading {len(blocks_to_offload)} blocks to CPU")
+        # Decide which blocks to keep on GPU
+        if self.stateless:
+            # STATELESS: Offload ALL blocks, zero persistence
+            blocks_to_keep_on_gpu = set()
+            blocks_to_offload = set(range(self.num_blocks))
+            if self.logger:
+                self.logger.info(f"[RabbitVideo] STATELESS: Offloading ALL {self.num_blocks} blocks to CPU")
+        else:
+            # MINIMAL: Keep only 1 block on GPU
+            blocks_to_keep_on_gpu = set(range(min(self.blocks_to_keep, 1)))
+            blocks_to_offload = set(range(self.num_blocks)) - blocks_to_keep_on_gpu
+            if self.logger:
+                self.logger.info(f"[RabbitVideo] Keeping blocks {list(blocks_to_keep_on_gpu)} on GPU")
+                self.logger.info(f"[RabbitVideo] Offloading {len(blocks_to_offload)} blocks to CPU")
 
         # Offload blocks not in the initial set
         for block_idx in sorted(blocks_to_offload):
@@ -474,6 +487,8 @@ class RabbitVideoOffloader:
         if self.logger:
             self.logger.info(f"[RabbitVideo] After initialization: "
                            f"Allocated={alloc:.2f}GB, Reserved={reserved:.2f}GB, Cache={cache:.2f}GB")
+            if self.stateless:
+                self.logger.info(f"[RabbitVideo] STATELESS: Zero blocks on GPU, will load on-demand")
 
     def ensure_block_on_gpu(self, block_idx: int):
         """
@@ -556,6 +571,38 @@ class RabbitVideoOffloader:
                 self.logger.info(f"[RabbitVideo] Prefetching block {block_idx} | Available: {available:.2f}GB")
             block = self.blocks_dict[block_idx]
             self.block_manager.move_block_to_gpu(block, block_idx)
+
+    def offload_block_after_execution(self, block_idx: int):
+        """
+        STATELESS MODE: Immediately offload block after execution.
+
+        This ensures zero blocks persist on GPU between executions,
+        achieving absolute minimal peak memory usage.
+
+        Args:
+            block_idx: Index of block to offload
+        """
+        if not self.tracker.is_on_gpu(block_idx):
+            return  # Already offloaded
+
+        if self.debug and self.logger:
+            self.logger.info(f"[RabbitVideo] STATELESS: Offloading block {block_idx} after execution")
+
+        block = self.blocks_dict[block_idx]
+        self.block_manager.move_block_to_cpu(block, block_idx)
+
+        # Aggressive cache clear in stateless mode
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        # Update tracker
+        self.tracker.current_executing_block = None
+
+        # Record memory state (should be near-zero blocks on GPU)
+        self.memory_monitor.record(
+            blocks_on_gpu=len(self.tracker.gpu_blocks),
+            current_block=-1
+        )
 
     def clear_cache_after_block(self):
         """
