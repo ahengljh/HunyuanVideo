@@ -293,17 +293,24 @@ class TextEncoder(nn.Module):
                 If None, self.output_key will be used. Defaults to None.
             return_texts (bool): Whether to return the decoded texts. Defaults to False.
         """
-        device = self.model.device if device is None else device
+        # Get the actual device from model parameters (not model.device which may not exist)
+        if device is None:
+            device = next(self.model.parameters()).device
+
         use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
         hidden_state_skip_layer = use_default(
             hidden_state_skip_layer, self.hidden_state_skip_layer
         )
         do_sample = use_default(do_sample, not self.reproduce)
+
+        # Ensure all inputs are on the same device as the model
+        input_ids = batch_encoding["input_ids"].to(device)
         attention_mask = (
             batch_encoding["attention_mask"].to(device) if use_attention_mask else None
         )
+
         outputs = self.model(
-            input_ids=batch_encoding["input_ids"].to(device),
+            input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=output_hidden_states
             or hidden_state_skip_layer is not None,
