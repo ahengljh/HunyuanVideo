@@ -95,15 +95,28 @@ python sample_video.py \
     --prompt "A cat walking in the garden"
 ```
 
-### Save Memory Timeline
+### Save Memory Timeline (Baseline Comparison)
 
-To save memory usage timeline to a JSON file for analysis:
+**NEW**: Timeline monitoring now works independently of RabbitVideo, enabling baseline measurements:
 
+**Capture baseline (without RabbitVideo):**
+```bash
+python sample_video.py \
+    --save-memory-timeline ./baseline_memory.json \
+    --prompt "A cat walking in the garden"
+```
+
+**Capture with RabbitVideo:**
 ```bash
 python sample_video.py \
     --rabbit-mode \
-    --rabbit-save-timeline ./memory_timeline.json \
+    --save-memory-timeline ./rabbit_memory.json \
     --prompt "A cat walking in the garden"
+```
+
+Then compare side-by-side:
+```bash
+python visualize_rabbit_timeline.py baseline_memory.json rabbit_memory.json --compare
 ```
 
 ## Command-Line Flags
@@ -113,8 +126,8 @@ python sample_video.py \
 | `--rabbit-mode` | Enable RabbitVideo block-level offloading | False |
 | `--rabbit-aggressive-offload` | Keep only 2 blocks on GPU (vs 5 default) | False |
 | `--rabbit-stateless` | Enable stateless mode (zero persistence, recomputation) | False |
-| `--rabbit-debug` | Enable detailed memory logging | False |
-| `--rabbit-save-timeline PATH` | Save memory timeline to JSON file | "" |
+| `--rabbit-debug` | Enable detailed memory logging (requires --rabbit-mode) | False |
+| `--save-memory-timeline PATH` | Save memory timeline JSON (works with or without RabbitVideo) | "" |
 
 ## Performance Comparison
 

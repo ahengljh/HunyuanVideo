@@ -175,6 +175,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         text_encoder_2: Optional[TextEncoder] = None,
         progress_bar_config: Dict[str, Any] = None,
         args=None,
+        memory_monitor=None,
     ):
         super().__init__()
 
@@ -186,6 +187,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self._progress_bar_config.update(progress_bar_config)
 
         self.args = args
+        self.memory_monitor = memory_monitor  # Standalone memory monitoring
         # ==========================================================================================
 
         if (
@@ -989,11 +991,19 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # Record memory before denoising loop
+        if self.memory_monitor is not None:
+            self.memory_monitor.record(blocks_on_gpu=0, current_block=-1)
+
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                # Record memory at each step
+                if self.memory_monitor is not None:
+                    self.memory_monitor.record(blocks_on_gpu=0, current_block=i)
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1137,6 +1147,20 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().float()
+
+        # Record final memory state and save timeline
+        if self.memory_monitor is not None:
+            self.memory_monitor.record(blocks_on_gpu=0, current_block=-1)
+
+            # Save timeline if path is specified
+            if hasattr(self.args, 'save_memory_timeline') and self.args.save_memory_timeline:
+                self.memory_monitor.save_timeline(self.args.save_memory_timeline)
+                print(f"[Memory Timeline] Saved to: {self.args.save_memory_timeline}")
+
+                # Print summary
+                peak_alloc, peak_res = self.memory_monitor.get_peak_memory()
+                print(f"[Memory Timeline] Peak Allocated: {peak_alloc:.2f} GB")
+                print(f"[Memory Timeline] Peak Reserved: {peak_res:.2f} GB")
 
         # Offload all models
         self.maybe_free_model_hooks()

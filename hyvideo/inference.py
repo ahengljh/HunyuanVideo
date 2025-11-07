@@ -194,6 +194,7 @@ class Inference(object):
         logger=None,
         parallel_args=None,
         rabbit_offloader=None,
+        memory_monitor=None,
     ):
         self.vae = vae
         self.vae_kwargs = vae_kwargs
@@ -205,6 +206,7 @@ class Inference(object):
         self.pipeline = pipeline
         self.use_cpu_offload = use_cpu_offload
         self.rabbit_offloader = rabbit_offloader
+        self.memory_monitor = memory_monitor
 
         self.args = args
         self.device = (
@@ -342,6 +344,17 @@ class Inference(object):
                 device=text_encoder_device,
             )
 
+        # ========================= Memory Timeline Monitoring ====================
+        # Standalone memory monitoring (works with or without RabbitVideo)
+        memory_monitor = None
+        save_timeline_path = getattr(args, 'save_memory_timeline', '')
+        if save_timeline_path:
+            from hyvideo.rabbit_video import MemoryMonitor
+            memory_monitor = MemoryMonitor(device=device, debug=False, logger=logger)
+            logger.info(f"Memory timeline monitoring enabled. Will save to: {save_timeline_path}")
+            # Record initial state
+            memory_monitor.record(blocks_on_gpu=0, current_block=-1)
+
         # ========================= RabbitVideo Initialization ====================
         rabbit_offloader = None
         if getattr(args, 'rabbit_mode', False):
@@ -370,6 +383,7 @@ class Inference(object):
             logger.info(f"Stateless mode (recomputation): {rabbit_stateless}")
 
             # Initialize RabbitVideo offloader
+            # If standalone memory monitor exists, RabbitVideo will use it; otherwise creates its own
             rabbit_offloader = RabbitVideoOffloader(
                 model=model,
                 device=device,
@@ -399,7 +413,8 @@ class Inference(object):
             device=device,
             logger=logger,
             parallel_args=parallel_args,
-            rabbit_offloader=rabbit_offloader
+            rabbit_offloader=rabbit_offloader,
+            memory_monitor=memory_monitor
         )
 
     @staticmethod
@@ -567,6 +582,7 @@ class HunyuanVideoSampler(Inference):
             scheduler=scheduler,
             progress_bar_config=progress_bar_config,
             args=args,
+            memory_monitor=self.memory_monitor,
         )
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()

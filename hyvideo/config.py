@@ -272,10 +272,10 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Enable detailed memory logging for RabbitVideo. Requires --rabbit-mode.",
     )
     group.add_argument(
-        "--rabbit-save-timeline",
+        "--save-memory-timeline",
         type=str,
         default="",
-        help="Path to save memory timeline JSON. Requires --rabbit-mode.",
+        help="Path to save memory usage timeline JSON (works with or without --rabbit-mode for baseline comparison).",
     )
     group.add_argument(
         "--rabbit-stateless",
@@ -429,11 +429,12 @@ def sanity_check_args(args):
         raise ValueError("--rabbit-aggressive-offload requires --rabbit-mode to be enabled.")
     if args.rabbit_debug and not args.rabbit_mode:
         raise ValueError("--rabbit-debug requires --rabbit-mode to be enabled.")
-    if args.rabbit_save_timeline and not args.rabbit_mode:
-        raise ValueError("--rabbit-save-timeline requires --rabbit-mode to be enabled.")
     if args.rabbit_stateless and not args.rabbit_mode:
         raise ValueError("--rabbit-stateless requires --rabbit-mode to be enabled.")
     if args.rabbit_mode and args.use_cpu_offload:
         raise ValueError("Cannot use both --rabbit-mode and --use-cpu-offload. Choose one.")
+
+    # Note: --save-memory-timeline works independently (no validation needed)
+    # This allows baseline measurements without RabbitVideo for comparison
 
     return args
