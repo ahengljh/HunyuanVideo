@@ -42,12 +42,13 @@ except:
     init_distributed_environment = None
 
 
-def wrap_transformer_with_rabbit_video(model, rabbit_offloader):
+def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance):
     """
     Wrap transformer forward pass to enable RabbitVideo block swapping.
 
     This function intercepts block execution to ensure each block is loaded
-    to GPU before execution using the RabbitVideoOffloader.
+    to GPU before execution using the RabbitVideoOffloader, with aggressive
+    cache clearing after each block.
     """
     # Wrap double blocks
     for block_idx, block in enumerate(model.double_blocks):
@@ -59,7 +60,10 @@ def wrap_transformer_with_rabbit_video(model, rabbit_offloader):
                 # Ensure block is on GPU before execution
                 rabbit_offloader.ensure_block_on_gpu(idx)
                 # Execute block
-                return orig_forward(*args, **kwargs)
+                result = orig_forward(*args, **kwargs)
+                # AGGRESSIVE: Clear cache after block execution
+                rabbit_offloader.clear_cache_after_block()
+                return result
             return wrapped_forward
 
         block.forward = make_wrapped_forward(original_forward, block_idx)
@@ -76,12 +80,16 @@ def wrap_transformer_with_rabbit_video(model, rabbit_offloader):
                 # Ensure block is on GPU before execution
                 rabbit_offloader.ensure_block_on_gpu(idx)
                 # Execute block
-                return orig_forward(*args, **kwargs)
+                result = orig_forward(*args, **kwargs)
+                # AGGRESSIVE: Clear cache after block execution
+                rabbit_offloader.clear_cache_after_block()
+                return result
             return wrapped_forward
 
         block.forward = make_wrapped_forward(original_forward, global_block_idx)
 
-    logger.info(f"[RabbitVideo] Wrapped {len(model.double_blocks) + len(model.single_blocks)} transformer blocks")
+    if logger_instance:
+        logger_instance.info(f"[RabbitVideo] Wrapped {len(model.double_blocks) + len(model.single_blocks)} transformer blocks")
 
 
 def parallelize_transformer(pipe):
@@ -327,14 +335,15 @@ class Inference(object):
                                "Please disable --rabbit-mode or set ulysses/ring degrees to 1.")
 
             # Determine blocks to keep on GPU
-            DEFAULT_BLOCKS_TO_KEEP = 5
-            AGGRESSIVE_BLOCKS_TO_KEEP = 2
+            # NEW DEFAULT: Keep only 1 block on GPU for minimal memory usage
+            DEFAULT_BLOCKS_TO_KEEP = 1  # Changed from 5 to 1 for minimal memory
+            AGGRESSIVE_BLOCKS_TO_KEEP = 1  # Same as default now
             rabbit_aggressive = getattr(args, 'rabbit_aggressive_offload', False)
             rabbit_debug = getattr(args, 'rabbit_debug', False)
-            blocks_to_keep = AGGRESSIVE_BLOCKS_TO_KEEP if rabbit_aggressive else DEFAULT_BLOCKS_TO_KEEP
+            blocks_to_keep = DEFAULT_BLOCKS_TO_KEEP  # Always use minimal mode
 
-            logger.info(f"Initializing RabbitVideo with {blocks_to_keep} blocks on GPU...")
-            logger.info(f"Aggressive mode: {rabbit_aggressive}")
+            logger.info(f"Initializing RabbitVideo with {blocks_to_keep} blocks on GPU (minimal memory mode)...")
+            logger.info(f"Aggressive offload mode (deprecated, now always minimal): {rabbit_aggressive}")
             logger.info(f"Debug mode: {rabbit_debug}")
 
             # Initialize RabbitVideo offloader
@@ -342,14 +351,15 @@ class Inference(object):
                 model=model,
                 device=device,
                 blocks_to_keep=blocks_to_keep,
-                debug=rabbit_debug
+                debug=rabbit_debug,
+                logger=logger
             )
 
             # Phase 1: Smart initialization with proactive offloading
             rabbit_offloader.initialize_offloading()
 
             # Phase 2: Wrap transformer blocks for dynamic swapping
-            wrap_transformer_with_rabbit_video(model, rabbit_offloader)
+            wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger)
 
             logger.info("RabbitVideo initialization complete.")
             logger.info("=" * 80)
