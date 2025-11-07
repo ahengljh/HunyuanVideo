@@ -913,6 +913,19 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if prompt_mask_2 is not None:
                 prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
+        # RabbitVideo Phase 3: Offload text encoders to CPU after encoding
+        # Text encoders are no longer needed during the denoising loop
+        if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+            if self.text_encoder is not None:
+                self.text_encoder.to('cpu')
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            if self.text_encoder_2 is not None:
+                self.text_encoder_2.to('cpu')
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
         # 4. Prepare timesteps
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
@@ -962,6 +975,15 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
+
+        # RabbitVideo Phase 3: Offload VAE to CPU before denoising loop
+        # VAE is not needed during denoising and will be loaded back for decoding
+        if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+            if self.vae is not None:
+                self.vae.to('cpu')
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -1079,6 +1101,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             else:
                 latents = latents / self.vae.config.scaling_factor
 
+            # RabbitVideo Phase 3: Temporarily move VAE to GPU for decoding
+            if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+                if self.vae is not None:
+                    self.vae.to(device)
+                    torch.cuda.synchronize()
+
             with torch.autocast(
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
@@ -1091,6 +1119,14 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     image = self.vae.decode(
                         latents, return_dict=False, generator=generator
                     )[0]
+
+            # RabbitVideo Phase 3: Move VAE back to CPU after decoding
+            if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+                if self.vae is not None:
+                    self.vae.to('cpu')
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
             if expand_temporal_dim or image.shape[2] == 1:
                 image = image.squeeze(2)
