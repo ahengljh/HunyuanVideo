@@ -185,7 +185,8 @@ class TextEncoder(nn.Module):
             device=device,
         )
         self.dtype = self.model.dtype
-        self.device = self.model.device
+        # Don't store device as an attribute - always get it fresh from parameters
+        # This ensures correct device detection after model movement (e.g., CPU offloading)
 
         self.tokenizer, self.tokenizer_path = load_tokenizer(
             tokenizer_type=self.tokenizer_type,
@@ -295,7 +296,16 @@ class TextEncoder(nn.Module):
         """
         # Get the actual device from model parameters (not model.device which may not exist)
         if device is None:
-            device = next(self.model.parameters()).device
+            try:
+                # Get device from first parameter
+                device = next(self.model.parameters()).device
+            except StopIteration:
+                # If no parameters, default to CPU
+                device = torch.device('cpu')
+
+        # Ensure device is a torch.device object
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
 
         use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
         hidden_state_skip_layer = use_default(
@@ -303,11 +313,17 @@ class TextEncoder(nn.Module):
         )
         do_sample = use_default(do_sample, not self.reproduce)
 
-        # Ensure all inputs are on the same device as the model
-        input_ids = batch_encoding["input_ids"].to(device)
-        attention_mask = (
-            batch_encoding["attention_mask"].to(device) if use_attention_mask else None
-        )
+        # CRITICAL: Ensure batch_encoding tensors are on CPU first, then move to model device
+        # This handles the case where tokenizer might create tensors on CUDA by default
+        input_ids = batch_encoding["input_ids"]
+        if input_ids.device != device:
+            input_ids = input_ids.to(device)
+
+        attention_mask = None
+        if use_attention_mask:
+            attention_mask = batch_encoding["attention_mask"]
+            if attention_mask.device != device:
+                attention_mask = attention_mask.to(device)
 
         outputs = self.model(
             input_ids=input_ids,
