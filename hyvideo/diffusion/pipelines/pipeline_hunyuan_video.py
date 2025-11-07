@@ -838,6 +838,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
 
+        # In smart loading mode, VAE/text encoders may be on CPU, so use transformer device
+        if hasattr(self.transformer, 'device'):
+            device = self.transformer.device
+        elif device == torch.device('cpu') and torch.cuda.is_available():
+            # Fallback: if device is CPU but CUDA available, use CUDA
+            device = torch.device('cuda')
+
         # 3. Encode input prompt
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None)
