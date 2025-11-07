@@ -220,14 +220,18 @@ class OffloadManager:
 
             # Check if we need to free memory first
             block_memory = self.block_memory_size[block_idx]
-            if self._get_current_gpu_memory() + block_memory > self.gpu_memory_limit:
+            current_mem = self._get_current_gpu_memory()
+            if current_mem + block_memory > self.gpu_memory_limit:
                 # SYNCHRONOUSLY free memory BEFORE loading new block
-                print(f"[RabbitVideo] Memory {self._get_current_gpu_memory()/1024**3:.1f}GB > threshold, considering offloading")
+                reserved_mem = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+                print(f"[RabbitVideo] Block {block_idx} needs {block_memory/1024**3:.2f}GB, current {current_mem/1024**3:.2f}GB (reserved {reserved_mem/1024**3:.2f}GB) > threshold, offloading...")
                 self._free_gpu_memory(block_memory)
                 # Wait for all offloading to complete and free reserved memory
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                print(f"[RabbitVideo] After offload: {self._get_current_gpu_memory()/1024**3:.1f}GB")
+                after_mem = self._get_current_gpu_memory()
+                after_reserved = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+                print(f"[RabbitVideo] After offload: allocated {after_mem/1024**3:.2f}GB, reserved {after_reserved/1024**3:.2f}GB")
 
             # Move block to GPU SYNCHRONOUSLY (blocking=True is default)
             block.to('cuda')  # This is synchronous by default
@@ -295,24 +299,40 @@ class OffloadManager:
 
     def _free_gpu_memory(self, required_memory: float):
         """Free GPU memory by offloading blocks to CPU SYNCHRONOUSLY."""
+        mem_before = self._get_current_gpu_memory()
+        print(f"[RabbitVideo] _free_gpu_memory called: need {required_memory/1024**3:.2f}GB, current {mem_before/1024**3:.2f}GB")
+
         # Sort blocks by access frequency (least recently used first)
         gpu_blocks = list(self.blocks_on_gpu)
         gpu_blocks.sort(key=lambda x: (self.block_access_counts[x],
                                        self.block_last_access.get(x, 0)))
 
+        print(f"[RabbitVideo] Blocks on GPU: {len(gpu_blocks)}, will offload up to {required_memory/1024**3:.2f}GB")
+
         freed_memory = 0
+        blocks_offloaded = 0
         for block_idx in gpu_blocks:
             if freed_memory >= required_memory:
                 break
 
             if block_idx not in self.blocks_in_transfer:
+                mem_before_block = self._get_current_gpu_memory()
                 self._move_block_to_cpu(block_idx)  # This is now synchronous
+                mem_after_block = self._get_current_gpu_memory()
+                actual_freed = mem_before_block - mem_after_block
+                print(f"[RabbitVideo]   Block {block_idx}: {mem_before_block/1024**3:.2f}GB -> {mem_after_block/1024**3:.2f}GB (freed {actual_freed/1024**3:.2f}GB)")
                 freed_memory += self.block_memory_size[block_idx]
+                blocks_offloaded += 1
 
         # CRITICAL: Final synchronize to ensure ALL offloads completed
         # and reserved memory is actually freed before returning
+        mem_before_sync = self._get_current_gpu_memory()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        mem_after_sync = self._get_current_gpu_memory()
+
+        print(f"[RabbitVideo] Offloaded {blocks_offloaded} blocks, memory: {mem_before/1024**3:.2f}GB -> {mem_after_sync/1024**3:.2f}GB (freed {(mem_before-mem_after_sync)/1024**3:.2f}GB)")
+        print(f"[RabbitVideo]   After sync/cache: {mem_before_sync/1024**3:.2f}GB -> {mem_after_sync/1024**3:.2f}GB")
 
     def offload_cold_blocks(self, current_block_idx: int):
         """Offload blocks that are unlikely to be used soon."""
