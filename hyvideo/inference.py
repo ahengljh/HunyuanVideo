@@ -57,6 +57,25 @@ def _normalize_device(device):
     return torch.device(device)
 
 
+def _move_support_modules_to_device(model, device: torch.device):
+    """Move non-block transformer components to the target device."""
+    support_attrs = [
+        "img_in",
+        "txt_in",
+        "time_in",
+        "vector_in",
+        "guidance_in",
+        "final_layer",
+    ]
+    for attr in support_attrs:
+        module = getattr(model, attr, None)
+        if module is None:
+            continue
+        module.to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+
 def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance):
     """
     Wrap transformer forward pass to enable RabbitVideo block swapping.
@@ -296,6 +315,9 @@ class Inference(object):
             model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
+
+        if getattr(args, 'rabbit_mode', False):
+            _move_support_modules_to_device(model, device)
 
         # ============================= Build extra models ========================
         # VAE
