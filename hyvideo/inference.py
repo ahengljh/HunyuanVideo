@@ -42,6 +42,21 @@ except:
     init_distributed_environment = None
 
 
+def _normalize_device(device):
+    """Convert assorted device representations into ``torch.device`` objects."""
+    if isinstance(device, torch.device):
+        return device
+    if device is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, str):
+        return torch.device(device)
+    if isinstance(device, int):
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{device}")
+        return torch.device("cpu")
+    return torch.device(device)
+
+
 def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance):
     """
     Wrap transformer forward pass to enable RabbitVideo block swapping.
@@ -209,13 +224,7 @@ class Inference(object):
         self.memory_monitor = memory_monitor
 
         self.args = args
-        self.device = (
-            device
-            if device is not None
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        self.device = _normalize_device(device)
         self.logger = logger
         self.parallel_args = parallel_args
 
@@ -257,6 +266,8 @@ class Inference(object):
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        device = _normalize_device(device)
+
         parallel_args = {"ulysses_degree": args.ulysses_degree, "ring_degree": args.ring_degree}
 
         # ======================== Get the args path =============================
@@ -266,7 +277,8 @@ class Inference(object):
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
+        transformer_init_device = torch.device("cpu") if getattr(args, 'rabbit_mode', False) else device
+        factor_kwargs = {"device": transformer_init_device, "dtype": PRECISION_TO_TYPE[args.precision]}
         in_channels = args.latent_channels
         out_channels = args.latent_channels
 
@@ -278,7 +290,10 @@ class Inference(object):
         )
         if args.use_fp8:
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
-        model = model.to(device)
+        if getattr(args, 'rabbit_mode', False):
+            model = model.to(torch.device("cpu"))
+        else:
+            model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
 
@@ -576,6 +591,8 @@ class HunyuanVideoSampler(Inference):
             else:
                 raise ValueError(f"Invalid denoise type {args.denoise_type}")
 
+        target_device = _normalize_device(device)
+
         pipeline = HunyuanVideoPipeline(
             vae=vae,
             text_encoder=text_encoder,
@@ -588,8 +605,10 @@ class HunyuanVideoSampler(Inference):
         )
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()
-        else:
-            pipeline = pipeline.to(device)
+        elif not getattr(args, 'rabbit_mode', False):
+            pipeline = pipeline.to(target_device)
+
+        pipeline.execution_device = target_device
 
         return pipeline
 

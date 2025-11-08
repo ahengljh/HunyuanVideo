@@ -154,6 +154,11 @@ class BlockTracker:
         self.cpu_blocks.add(block_idx)
         self.gpu_blocks.discard(block_idx)
 
+    def set_initial_locations(self, gpu_block_indices: Set[int]):
+        """Set tracker state based on actual block placement."""
+        self.gpu_blocks = set(gpu_block_indices)
+        self.cpu_blocks = set(range(self.num_blocks)) - self.gpu_blocks
+
     def select_blocks_to_offload(self, num_needed: int) -> List[int]:
         """
         Select blocks to offload using LRU policy.
@@ -395,7 +400,7 @@ class RabbitVideoOffloader:
             stateless: Enable stateless mode (load→execute→offload immediately, zero persistence)
         """
         self.model = model
-        self.device = device
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.blocks_to_keep = blocks_to_keep
         self.debug = debug
         self.logger = logger
@@ -413,9 +418,17 @@ class RabbitVideoOffloader:
             self.blocks_dict[i] = block
 
         # Initialize components
-        self.memory_monitor = MemoryMonitor(device, debug=debug, logger=logger)
+        self.memory_monitor = MemoryMonitor(self.device, debug=debug, logger=logger)
         self.tracker = BlockTracker(self.num_blocks, debug=debug, logger=logger)
-        self.block_manager = BlockManager(device, self.tracker, self.memory_monitor, debug=debug, logger=logger)
+        self.block_manager = BlockManager(self.device, self.tracker, self.memory_monitor, debug=debug, logger=logger)
+
+        # Initialize tracker state based on actual block placement
+        gpu_block_indices = set()
+        for idx, block in self.blocks_dict.items():
+            block_device = self._get_block_device(block)
+            if block_device == self.device:
+                gpu_block_indices.add(idx)
+        self.tracker.set_initial_locations(gpu_block_indices)
 
         # Track current execution state
         self.current_step = 0
@@ -442,9 +455,9 @@ class RabbitVideoOffloader:
         """
         if self.logger:
             self.logger.info(f"[RabbitVideo] Phase 1: Proactive offloading initialization")
-        self.memory_monitor.record(blocks_on_gpu=self.num_blocks, current_block=-1)
+        self.memory_monitor.record(blocks_on_gpu=len(self.tracker.gpu_blocks), current_block=-1)
 
-        # First, calculate block sizes while they're on GPU
+        # First, calculate block sizes
         for i, block in enumerate(self.all_blocks):
             self.tracker.set_block_size(i, block)
 
@@ -469,14 +482,17 @@ class RabbitVideoOffloader:
 
         # Offload blocks not in the initial set
         for block_idx in sorted(blocks_to_offload):
-            block = self.blocks_dict[block_idx]
-            self.block_manager.move_block_to_cpu(block, block_idx)
+            if self.tracker.is_on_gpu(block_idx):
+                block = self.blocks_dict[block_idx]
+                self.block_manager.move_block_to_cpu(block, block_idx)
 
-        # Mark initial blocks as on GPU
-        for block_idx in blocks_to_keep_on_gpu:
-            self.tracker.mark_on_gpu(block_idx)
+        # Ensure desired blocks are resident on GPU
+        for block_idx in sorted(blocks_to_keep_on_gpu):
+            if not self.tracker.is_on_gpu(block_idx):
+                block = self.blocks_dict[block_idx]
+                self.block_manager.move_block_to_gpu(block, block_idx)
 
-        self.memory_monitor.record(blocks_on_gpu=len(blocks_to_keep_on_gpu), current_block=-1)
+        self.memory_monitor.record(blocks_on_gpu=len(self.tracker.gpu_blocks), current_block=-1)
 
         # Aggressive cache clearing after initialization
         torch.cuda.empty_cache()
@@ -651,6 +667,12 @@ class RabbitVideoOffloader:
     def save_timeline(self, filepath: str):
         """Save memory timeline data."""
         self.memory_monitor.save_timeline(filepath)
+
+    @staticmethod
+    def _get_block_device(block) -> torch.device:
+        for param in block.parameters():
+            return param.device
+        return torch.device('cpu')
 
 
 def offload_auxiliary_models_to_cpu(vae, text_encoder, text_encoder_2=None, logger=None):

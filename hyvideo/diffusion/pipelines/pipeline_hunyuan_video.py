@@ -841,12 +841,30 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         if dist.is_initialized():
             device = torch.device(f"cuda:{dist.get_rank()}")
         else:
-            device = getattr(self, "_execution_device", None)
+            device = getattr(self, "execution_device", None)
+            if device is None:
+                device = getattr(self, "_execution_device", None)
             if device is None:
                 try:
                     device = next(self.transformer.parameters()).device
                 except StopIteration:
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def _ensure_module_on_device(module, target_device):
+            if module is None:
+                return
+            try:
+                current_device = next(module.parameters()).device
+            except StopIteration:
+                current_device = target_device
+            if current_device != target_device:
+                module.to(target_device)
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize()
+
+        if hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
+            _ensure_module_on_device(self.text_encoder, device)
+            _ensure_module_on_device(self.text_encoder_2, device)
 
         # 3. Encode input prompt
         lora_scale = (
