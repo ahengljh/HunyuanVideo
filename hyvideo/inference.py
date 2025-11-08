@@ -588,14 +588,8 @@ class HunyuanVideoSampler(Inference):
         )
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()
-            exec_device = torch.device("cpu")
         else:
             pipeline = pipeline.to(device)
-            exec_device = device if isinstance(device, torch.device) else torch.device(device)
-
-        # Diffusers normally sets `_execution_device` when moving the pipeline,
-        # but custom initialization paths here can skip that, so set it explicitly.
-        pipeline._execution_device = exec_device
 
         return pipeline
 

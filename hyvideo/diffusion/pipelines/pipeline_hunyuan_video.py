@@ -837,18 +837,16 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        # Device detection: Handle RabbitVideo mode where transformer blocks may be on CPU
+        # Device detection
         if dist.is_initialized():
             device = torch.device(f"cuda:{dist.get_rank()}")
-        elif hasattr(self.args, 'rabbit_mode') and self.args.rabbit_mode:
-            # In RabbitVideo mode, transformer blocks may be on CPU, so get device from VAE
-            try:
-                device = next(self.vae.parameters()).device
-            except StopIteration:
-                # Fallback to _execution_device if VAE has no parameters
-                device = self._execution_device
         else:
-            device = self._execution_device
+            device = getattr(self, "_execution_device", None)
+            if device is None:
+                try:
+                    device = next(self.transformer.parameters()).device
+                except StopIteration:
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # 3. Encode input prompt
         lora_scale = (
