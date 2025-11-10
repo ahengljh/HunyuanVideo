@@ -395,9 +395,9 @@ class Inference(object):
         # ========================= RabbitVideo Initialization ====================
         rabbit_offloader = None
         if getattr(args, 'rabbit_mode', False):
-            logger.info("=" * 80)
-            logger.info("RabbitVideo: Memory-Efficient Video Diffusion via Strategic Block Offloading")
-            logger.info("=" * 80)
+            logger.debug("=" * 80)
+            logger.debug("RabbitVideo: Memory-Efficient Video Diffusion via Strategic Block Offloading")
+            logger.debug("=" * 80)
 
             # Validate rabbit mode is compatible with distributed settings
             if args.ulysses_degree > 1 or args.ring_degree > 1:
