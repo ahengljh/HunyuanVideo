@@ -176,6 +176,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         progress_bar_config: Dict[str, Any] = None,
         args=None,
         memory_monitor=None,
+        rabbit_offloader=None,
     ):
         super().__init__()
 
@@ -188,6 +189,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         self.args = args
         self.memory_monitor = memory_monitor  # Standalone memory monitoring
+        self.rabbit_offloader = rabbit_offloader  # RabbitVideo offloader with optional KV cache
         # ==========================================================================================
 
         if (
@@ -1080,6 +1082,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 latents = self.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                 )[0]
+
+                # Update KV cache with current latent state if rabbit offloader is active
+                if self.rabbit_offloader is not None and hasattr(self.rabbit_offloader, 'kv_cache_manager'):
+                    if self.rabbit_offloader.kv_cache_manager is not None:
+                        self.rabbit_offloader.kv_cache_manager.update_latent_state(
+                            latents, t.item(), num_inference_steps
+                        )
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

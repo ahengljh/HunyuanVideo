@@ -427,7 +427,10 @@ class Inference(object):
                 blocks_to_keep=blocks_to_keep,
                 debug=rabbit_debug,
                 logger=logger,
-                stateless=rabbit_stateless
+                stateless=rabbit_stateless,
+                enable_kv_cache=getattr(args, 'rabbit_kv_cache', False),
+                kv_cache_threshold=getattr(args, 'rabbit_kv_threshold', 0.05),
+                kv_cache_max_memory_gb=getattr(args, 'rabbit_kv_max_gb', 0.5)
             )
 
             # Phase 1: Smart initialization with proactive offloading
@@ -624,6 +627,7 @@ class HunyuanVideoSampler(Inference):
             progress_bar_config=progress_bar_config,
             args=args,
             memory_monitor=self.memory_monitor,
+            rabbit_offloader=self.rabbit_offloader,
         )
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()

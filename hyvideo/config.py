@@ -283,6 +283,25 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Enable stateless mode: load→execute→offload immediately (zero persistence, absolute minimal memory). Requires --rabbit-mode.",
     )
 
+    # ======================== RabbitVideo KV cache optimization ========================
+    group.add_argument(
+        "--rabbit-kv-cache",
+        action="store_true",
+        help="Enable KV cache for static regions during denoising. Requires --rabbit-mode.",
+    )
+    group.add_argument(
+        "--rabbit-kv-threshold",
+        type=float,
+        default=0.05,
+        help="Threshold for detecting static regions (lower = more sensitive). Default: 0.05",
+    )
+    group.add_argument(
+        "--rabbit-kv-max-gb",
+        type=float,
+        default=0.5,
+        help="Maximum memory (GB) to use for KV cache. Default: 0.5GB",
+    )
+
     # ======================== Inference general setting ========================
     group.add_argument(
         "--batch-size",
@@ -431,6 +450,8 @@ def sanity_check_args(args):
         raise ValueError("--rabbit-debug requires --rabbit-mode to be enabled.")
     if args.rabbit_stateless and not args.rabbit_mode:
         raise ValueError("--rabbit-stateless requires --rabbit-mode to be enabled.")
+    if args.rabbit_kv_cache and not args.rabbit_mode:
+        raise ValueError("--rabbit-kv-cache requires --rabbit-mode to be enabled.")
     if args.rabbit_mode and args.use_cpu_offload:
         raise ValueError("Cannot use both --rabbit-mode and --use-cpu-offload. Choose one.")
 

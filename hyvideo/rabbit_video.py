@@ -13,10 +13,13 @@ Key Components:
 """
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import time
 from collections import defaultdict, OrderedDict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any
 import json
+import numpy as np
 
 
 class MemoryMonitor:
@@ -387,9 +390,12 @@ class RabbitVideoOffloader:
                  blocks_to_keep: int = 1,
                  debug: bool = False,
                  logger=None,
-                 stateless: bool = False):
+                 stateless: bool = False,
+                 enable_kv_cache: bool = False,
+                 kv_cache_threshold: float = 0.05,
+                 kv_cache_max_gb: float = 0.5):
         """
-        Initialize RabbitVideo offloader.
+        Initialize RabbitVideo offloader with optional KV cache support.
 
         Args:
             model: HYVideoDiffusionTransformer model
@@ -398,6 +404,9 @@ class RabbitVideoOffloader:
             debug: Enable debug logging
             logger: Loguru logger instance
             stateless: Enable stateless mode (load→execute→offload immediately, zero persistence)
+            enable_kv_cache: Enable KV cache for static regions
+            kv_cache_threshold: Threshold for static region detection (lower = more conservative)
+            kv_cache_max_gb: Maximum GPU memory for KV cache
         """
         self.model = model
         self.device = device if isinstance(device, torch.device) else torch.device(device)
@@ -405,6 +414,7 @@ class RabbitVideoOffloader:
         self.debug = debug
         self.logger = logger
         self.stateless = stateless
+        self.enable_kv_cache = enable_kv_cache
 
         # Extract blocks from model
         self.double_blocks = list(model.double_blocks)
@@ -436,6 +446,45 @@ class RabbitVideoOffloader:
         # Disable prefetching in stateless mode
         self.prefetch_enabled = not stateless
 
+        # Initialize KV cache components if enabled
+        if enable_kv_cache:
+            self.static_detector = StaticRegionDetector(
+                base_threshold=kv_cache_threshold,
+                device=device,
+                debug=debug,
+                logger=logger
+            )
+
+            self.kv_cache = SelectiveKVCache(
+                num_blocks=self.num_blocks,
+                hidden_size=model.hidden_size,
+                num_heads=model.heads_num,
+                device=device,
+                max_cache_gb=kv_cache_max_gb,
+                debug=debug,
+                logger=logger
+            )
+
+            # Store reference in model for block access
+            if hasattr(model, 'set_kv_cache_manager'):
+                model.set_kv_cache_manager(self)
+            else:
+                # Fallback for older model versions
+                model.kv_cache_manager = self
+                # Manually set for blocks
+                for block in self.double_blocks:
+                    block.kv_cache_manager = self
+                for block in self.single_blocks:
+                    block.kv_cache_manager = self
+        else:
+            self.static_detector = None
+            self.kv_cache = None
+
+        # Track current latent for KV cache
+        self.current_latent = None
+        self.current_timestep = None
+        self.total_timesteps = None
+
         if self.logger:
             self.logger.debug(f"[RabbitVideo] Initialized with {self.num_blocks} blocks "
                            f"({len(self.double_blocks)} double + {len(self.single_blocks)} single)")
@@ -443,6 +492,8 @@ class RabbitVideoOffloader:
                 self.logger.debug(f"[RabbitVideo] STATELESS MODE: Zero blocks persist on GPU (absolute minimal memory)")
             else:
                 self.logger.debug(f"[RabbitVideo] Will keep {self.blocks_to_keep} blocks on GPU (minimal memory mode)")
+            if enable_kv_cache:
+                self.logger.debug(f"[RabbitVideo] KV Cache ENABLED: threshold={kv_cache_threshold}, max_gb={kv_cache_max_gb}")
 
     def initialize_offloading(self):
         """
@@ -517,6 +568,21 @@ class RabbitVideoOffloader:
             4. Load block SECOND
             5. Optionally prefetch next block
         """
+        # Clear KV cache if memory is getting tight
+        if self.enable_kv_cache and self.kv_cache:
+            alloc, reserved, _ = self.memory_monitor.get_current_memory()
+            gpu_capacity = torch.cuda.get_device_properties(self.device).total_memory / (1024**3)
+            available = gpu_capacity - reserved
+
+            # If less than 2GB available, clear some KV cache
+            if available < 2.0:
+                if self.debug and self.logger:
+                    self.logger.debug(f"[RabbitVideo] Low memory ({available:.2f}GB), clearing some KV cache")
+                # Clear cache for offloaded blocks
+                for b_idx in range(self.num_blocks):
+                    if not self.tracker.is_on_gpu(b_idx):
+                        self.kv_cache.clear_block_cache(b_idx)
+
         # Record access
         self.tracker.record_access(block_idx)
 
@@ -659,10 +725,138 @@ class RabbitVideoOffloader:
                            f"Alloc={alloc:.2f}GB, Reserved={reserved:.2f}GB, Cache={cache:.2f}GB | "
                            f"Blocks on GPU: {len(self.tracker.gpu_blocks)}")
 
+    def process_kv_with_cache(
+        self,
+        block_idx: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        latent: torch.Tensor = None,
+        timestep: int = None,
+        total_steps: int = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Process KV with selective caching for static regions.
+        Called by transformer blocks during forward pass.
+        """
+        if not self.enable_kv_cache or self.kv_cache is None:
+            return q, k, v
+
+        # IMPORTANT: Only use cache if block is currently on GPU
+        if not self.tracker.is_on_gpu(block_idx):
+            return q, k, v
+
+        # Use stored values if not provided
+        if latent is None:
+            latent = self.current_latent
+        if timestep is None:
+            timestep = self.current_timestep
+        if total_steps is None:
+            total_steps = self.total_timesteps
+
+        if latent is None or timestep is None or total_steps is None:
+            return q, k, v  # Cannot use cache without required info
+
+        # Check if we should use cache (VERY conservative strategy)
+        progress = 1.0 - (timestep / total_steps)
+        if progress < 0.8:  # Only use cache in final 20% of denoising
+            return q, k, v
+
+        # Deeper blocks are more stable
+        block_depth_ratio = block_idx / self.num_blocks
+        if block_depth_ratio < 0.5:  # Skip first half of blocks
+            return q, k, v
+
+        # Check available memory before caching
+        alloc, reserved, cache = self.memory_monitor.get_current_memory()
+        gpu_capacity = torch.cuda.get_device_properties(self.device).total_memory / (1024**3)
+        available = gpu_capacity - reserved
+
+        # Don't cache if memory is tight (less than 3GB available)
+        if available < 3.0:
+            if self.debug and self.logger:
+                self.logger.debug(f"[RabbitKV] Skipping cache - low memory: {available:.2f}GB")
+            return q, k, v
+
+        # Detect static regions
+        static_mask, reuse_ratio = self.static_detector.detect_static_regions(
+            latent, timestep, total_steps, block_idx
+        )
+
+        # If too few static regions, skip caching
+        if reuse_ratio < 0.2:  # Increased to 20% minimum static
+            return q, k, v
+
+        # Try to get cached KV
+        cached_kv = self.kv_cache.get_cached_kv(block_idx, timestep, static_mask)
+
+        if cached_kv is not None:
+            # Blend cached and new KV
+            k_cached, v_cached = cached_kv
+            # Use more memory-efficient approach
+            static_mask_expanded = static_mask
+            while len(static_mask_expanded.shape) < len(k.shape):
+                static_mask_expanded = static_mask_expanded.unsqueeze(-1)
+            static_mask_expanded = static_mask_expanded.expand_as(k)
+
+            # Blend without in-place operations to avoid gradient issues
+            dynamic_mask = 1 - static_mask_expanded
+            k = k * dynamic_mask + k_cached * static_mask_expanded
+            v = v * dynamic_mask + v_cached * static_mask_expanded
+
+            if self.debug and self.logger:
+                self.logger.debug(
+                    f"[RabbitKV] Using cached KV - Block {block_idx}, Step {timestep} | "
+                    f"Reuse: {reuse_ratio:.2%}"
+                )
+        else:
+            # Only cache if we have enough memory
+            if available > 4.0:  # Need at least 4GB free
+                self.kv_cache.update_cache(block_idx, timestep, k, v, static_mask)
+
+        return q, k, v
+
+    def update_latent_state(self, latent: torch.Tensor, timestep: int, total_steps: int):
+        """Update current latent state for KV cache detection."""
+        self.current_latent = latent
+        self.current_timestep = timestep
+        self.total_timesteps = total_steps
+
+    def on_block_offload(self, block_idx: int):
+        """Called when a block is offloaded to CPU. Clear its KV cache."""
+        if self.kv_cache:
+            self.kv_cache.clear_block_cache(block_idx)
+
     def print_summary(self):
         """Print final summary statistics."""
         self.memory_monitor.print_summary()
         self.tracker.print_statistics()
+
+        # Print KV cache statistics if enabled
+        if self.enable_kv_cache and self.logger:
+            self.logger.debug("\n" + "="*80)
+            self.logger.debug("KV Cache Statistics")
+            self.logger.debug("="*80)
+
+            # Static detection stats
+            if self.static_detector:
+                detector_stats = self.static_detector.get_statistics()
+                self.logger.debug(f"Static Detection:")
+                self.logger.debug(f"  Average static ratio: {detector_stats['avg_static_ratio']:.2%}")
+                self.logger.debug(f"  Recent reuse ratio: {detector_stats['recent_reuse_ratio']:.2%}")
+
+            # KV cache stats
+            if self.kv_cache:
+                cache_stats = self.kv_cache.get_statistics()
+                self.logger.debug(f"KV Cache:")
+                self.logger.debug(f"  Hit rate: {cache_stats['hit_rate']:.2%}")
+                self.logger.debug(f"  Cache hits: {cache_stats['cache_hits']}")
+                self.logger.debug(f"  Cache misses: {cache_stats['cache_misses']}")
+                self.logger.debug(f"  Memory used: {cache_stats['memory_used_gb']:.2f} GB")
+                self.logger.debug(f"  Cached blocks: {cache_stats['num_cached_blocks']}")
+                self.logger.debug(f"  Total entries: {cache_stats['total_entries']}")
+
+            self.logger.debug("="*80 + "\n")
 
     def save_timeline(self, filepath: str):
         """Save memory timeline data."""
@@ -735,3 +929,343 @@ def temporarily_move_to_gpu(model, device, operation_name: str = "operation", lo
             torch.cuda.synchronize()
 
     return TempGPUContext()
+
+
+# ============================================================================
+# KV Cache Support for Static Regions
+# ============================================================================
+
+class StaticRegionDetector:
+    """
+    Detects static regions in video latents across denoising steps.
+    Uses change detection to identify areas that can safely reuse KV cache.
+    """
+
+    def __init__(
+        self,
+        base_threshold: float = 0.05,
+        window_size: int = 8,
+        temporal_weight: float = 0.3,
+        device: torch.device = None,
+        debug: bool = False,
+        logger=None
+    ):
+        self.base_threshold = base_threshold
+        self.window_size = window_size
+        self.temporal_weight = temporal_weight
+        self.device = device or torch.device('cuda')
+        self.debug = debug
+        self.logger = logger
+
+        # History tracking
+        self.latent_history = OrderedDict()
+        self.max_history = 3
+
+        # Statistics
+        self.total_regions = 0
+        self.static_regions = 0
+        self.reuse_ratio_history = []
+
+    def detect_static_regions(
+        self,
+        current_latent: torch.Tensor,
+        timestep: int,
+        total_steps: int,
+        block_idx: int = None
+    ) -> Tuple[torch.Tensor, float]:
+        """Detect static regions in current latent compared to history."""
+        # Adaptive threshold based on denoising progress
+        progress = 1.0 - (timestep / total_steps)
+        adaptive_threshold = self._compute_adaptive_threshold(progress, block_idx)
+
+        # Get history key
+        history_key = f"t{timestep}_b{block_idx}"
+
+        # If no history, everything is dynamic
+        if history_key not in self.latent_history:
+            self.latent_history[history_key] = current_latent.detach().clone()
+            if len(self.latent_history) > self.max_history:
+                self.latent_history.popitem(last=False)
+            return torch.zeros_like(current_latent[:, 0:1, ...]), 0.0
+
+        # Compare with previous latent
+        prev_latent = self.latent_history[history_key]
+        change_map = self._compute_change_map(current_latent, prev_latent)
+        static_mask = self._create_static_mask(change_map, adaptive_threshold)
+
+        # Update history
+        self.latent_history[history_key] = current_latent.detach().clone()
+
+        # Calculate reuse ratio
+        reuse_ratio = static_mask.float().mean().item()
+        self.reuse_ratio_history.append(reuse_ratio)
+
+        # Update statistics
+        self.total_regions += static_mask.numel()
+        self.static_regions += static_mask.sum().item()
+
+        if self.debug and self.logger:
+            self.logger.debug(
+                f"[StaticDetector] Step {timestep}/{total_steps} Block {block_idx} | "
+                f"Threshold: {adaptive_threshold:.4f} | Static ratio: {reuse_ratio:.2%}"
+            )
+
+        return static_mask, reuse_ratio
+
+    def _compute_adaptive_threshold(self, progress: float, block_idx: Optional[int]) -> float:
+        """Compute adaptive threshold based on denoising progress."""
+        # Progress-based scaling (exponential for smooth transition)
+        progress_scale = 1.0 + (progress ** 2) * 3.0  # 1x to 4x scaling
+
+        # Block depth scaling
+        block_scale = 1.0
+        if block_idx is not None:
+            block_scale = 1.0 - (block_idx * 0.01)
+            block_scale = max(0.5, block_scale)
+
+        threshold = self.base_threshold * progress_scale * block_scale
+        return min(0.3, max(0.01, threshold))
+
+    def _compute_change_map(self, current: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
+        """Compute normalized change map between latents."""
+        if current.device != previous.device:
+            previous = previous.to(current.device)
+
+        # L2 distance normalized by magnitude
+        l2_change = torch.abs(current - previous)
+        l2_norm = l2_change / (torch.abs(current) + torch.abs(previous) + 1e-6)
+
+        # Cosine similarity change
+        cos_sim = F.cosine_similarity(current, previous, dim=1, eps=1e-6)
+        cos_change = 1.0 - cos_sim.unsqueeze(1)
+
+        # Combine metrics
+        change_map = 0.7 * l2_norm + 0.3 * cos_change
+        return change_map
+
+    def _create_static_mask(self, change_map: torch.Tensor, threshold: float) -> torch.Tensor:
+        """Create binary static mask from change map."""
+        # Apply windowed analysis for spatial coherence
+        if len(change_map.shape) == 5:  # Video [B, C, T, H, W]
+            kernel_size = (1, self.window_size, self.window_size)
+            padding = (0, self.window_size // 2, self.window_size // 2)
+            avg_pool = nn.AvgPool3d(kernel_size, stride=1, padding=padding)
+        else:  # Image [B, C, H, W]
+            kernel_size = self.window_size
+            padding = self.window_size // 2
+            avg_pool = nn.AvgPool2d(kernel_size, stride=1, padding=padding)
+
+        windowed_change = avg_pool(change_map)
+        static_mask = (windowed_change < threshold).float()
+
+        # Morphological cleanup
+        static_mask = self._morphological_cleanup(static_mask)
+        return static_mask
+
+    def _morphological_cleanup(self, mask: torch.Tensor) -> torch.Tensor:
+        """Apply morphological operations to clean up the mask."""
+        kernel_size = 3
+
+        if len(mask.shape) == 5:  # Video
+            kernel = torch.ones(1, 1, 1, kernel_size, kernel_size, device=mask.device)
+            # Erosion
+            mask = F.conv3d(mask, kernel, padding=kernel_size//2)
+            mask = (mask >= kernel_size * kernel_size).float()
+            # Dilation
+            mask = F.conv3d(mask, kernel, padding=kernel_size//2)
+            mask = (mask > 0).float()
+        else:  # Image
+            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask.device)
+            # Erosion
+            mask = F.conv2d(mask, kernel, padding=kernel_size//2)
+            mask = (mask >= kernel_size * kernel_size).float()
+            # Dilation
+            mask = F.conv2d(mask, kernel, padding=kernel_size//2)
+            mask = (mask > 0).float()
+
+        return mask
+
+    def get_statistics(self) -> Dict[str, float]:
+        """Get detection statistics."""
+        if self.total_regions == 0:
+            return {"avg_static_ratio": 0.0, "total_regions": 0}
+
+        return {
+            "avg_static_ratio": self.static_regions / self.total_regions,
+            "total_regions": self.total_regions,
+            "recent_reuse_ratio": np.mean(self.reuse_ratio_history[-10:]) if self.reuse_ratio_history else 0.0
+        }
+
+
+class SelectiveKVCache:
+    """
+    Manages selective KV caching for static regions.
+    Integrates with Rabbit's block offloading to minimize memory overhead.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        hidden_size: int,
+        num_heads: int,
+        device: torch.device = None,
+        max_cache_gb: float = 0.5,  # Conservative default
+        debug: bool = False,
+        logger=None
+    ):
+        self.num_blocks = num_blocks
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.device = device or torch.device('cuda')
+        self.max_cache_gb = max_cache_gb
+        self.debug = debug
+        self.logger = logger
+
+        # Cache storage
+        self.kv_cache: Dict[int, Dict[int, Dict]] = {}
+
+        # Statistics
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.memory_used_gb = 0.0
+
+        # LRU tracking
+        self.access_order = OrderedDict()
+
+    def get_cached_kv(
+        self,
+        block_idx: int,
+        timestep: int,
+        static_mask: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Retrieve cached KV for static regions."""
+        if block_idx not in self.kv_cache:
+            self.cache_misses += 1
+            return None
+
+        if timestep not in self.kv_cache[block_idx]:
+            self.cache_misses += 1
+            return None
+
+        cache_entry = self.kv_cache[block_idx][timestep]
+
+        # Update access order
+        cache_key = (block_idx, timestep)
+        if cache_key in self.access_order:
+            self.access_order.move_to_end(cache_key)
+
+        self.cache_hits += 1
+
+        if self.debug and self.logger:
+            hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses)
+            self.logger.debug(
+                f"[KVCache] Cache HIT - Block {block_idx}, Step {timestep} | "
+                f"Hit rate: {hit_rate:.2%}"
+            )
+
+        return cache_entry['k'], cache_entry['v']
+
+    def update_cache(
+        self,
+        block_idx: int,
+        timestep: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        static_mask: torch.Tensor
+    ):
+        """Update cache with new KV values - only store static regions to save memory."""
+        # Only cache static regions to reduce memory
+        static_indices = static_mask.nonzero(as_tuple=True)
+
+        if len(static_indices[0]) == 0:  # No static regions
+            return
+
+        # Calculate actual size we'll store (only static regions)
+        static_ratio = static_mask.float().mean().item()
+        actual_kv_size_gb = self._estimate_kv_memory(k, v) * static_ratio
+
+        # Check memory limit
+        while self.memory_used_gb + actual_kv_size_gb > self.max_cache_gb:
+            if not self._evict_lru_entry():
+                if self.logger:
+                    self.logger.warning("[KVCache] Cannot evict more entries")
+                return
+
+        # Store in cache - detach to avoid keeping computation graph
+        if block_idx not in self.kv_cache:
+            self.kv_cache[block_idx] = {}
+
+        # Store with no_grad to ensure no gradients are kept
+        with torch.no_grad():
+            self.kv_cache[block_idx][timestep] = {
+                'k': k.detach().contiguous(),  # Use contiguous instead of clone
+                'v': v.detach().contiguous(),  # Use contiguous instead of clone
+                'mask': static_mask.detach(),
+                'size_gb': actual_kv_size_gb
+            }
+
+        # Update tracking
+        cache_key = (block_idx, timestep)
+        self.access_order[cache_key] = True
+        self.memory_used_gb += actual_kv_size_gb
+
+        if self.debug and self.logger:
+            self.logger.debug(
+                f"[KVCache] Updated - Block {block_idx}, Step {timestep} | "
+                f"Size: {actual_kv_size_gb:.3f}GB | Total: {self.memory_used_gb:.2f}GB"
+            )
+
+    def _estimate_kv_memory(self, k: torch.Tensor, v: torch.Tensor) -> float:
+        """Estimate memory usage of KV pair in GB."""
+        k_bytes = k.numel() * k.element_size()
+        v_bytes = v.numel() * v.element_size()
+        return (k_bytes + v_bytes) / (1024 ** 3)
+
+    def _evict_lru_entry(self) -> bool:
+        """Evict least recently used cache entry."""
+        if not self.access_order:
+            return False
+
+        lru_key, _ = self.access_order.popitem(last=False)
+        block_idx, timestep = lru_key
+
+        if block_idx in self.kv_cache and timestep in self.kv_cache[block_idx]:
+            entry = self.kv_cache[block_idx][timestep]
+            self.memory_used_gb -= entry['size_gb']
+            del self.kv_cache[block_idx][timestep]
+
+            if self.debug and self.logger:
+                self.logger.debug(f"[KVCache] Evicted LRU - Block {block_idx}, Step {timestep}")
+            return True
+
+        return False
+
+    def clear_block_cache(self, block_idx: int):
+        """Clear all cache entries for a specific block."""
+        if block_idx in self.kv_cache:
+            for timestep in list(self.kv_cache[block_idx].keys()):
+                entry = self.kv_cache[block_idx][timestep]
+                self.memory_used_gb -= entry['size_gb']
+
+                cache_key = (block_idx, timestep)
+                if cache_key in self.access_order:
+                    del self.access_order[cache_key]
+
+            del self.kv_cache[block_idx]
+            if self.debug and self.logger:
+                self.logger.debug(f"[KVCache] Cleared cache for block {block_idx}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total_requests = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total_requests if total_requests > 0 else 0.0
+
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": hit_rate,
+            "memory_used_gb": self.memory_used_gb,
+            "num_cached_blocks": len(self.kv_cache),
+            "total_entries": sum(len(entries) for entries in self.kv_cache.values())
+        }
