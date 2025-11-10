@@ -63,7 +63,7 @@ class MemoryMonitor:
         self.timeline_data["current_block"].append(current_block)
 
         if self.debug and self.logger:
-            self.logger.info(f"[MemoryMonitor] T={timestamp:.1f}s | "
+            self.logger.debug(f"[MemoryMonitor] T={timestamp:.1f}s | "
                        f"Allocated: {allocated:.2f}GB | "
                        f"Reserved: {reserved:.2f}GB | "
                        f"Cache: {cache:.2f}GB | "
@@ -86,18 +86,18 @@ class MemoryMonitor:
         with open(filepath, 'w') as f:
             json.dump(self.timeline_data, f, indent=2)
         if self.logger:
-            self.logger.info(f"[MemoryMonitor] Timeline data saved to {filepath}")
+            self.logger.debug(f"[MemoryMonitor] Timeline data saved to {filepath}")
 
     def print_summary(self):
         """Print memory usage summary."""
         if self.logger:
-            self.logger.info("\n" + "="*80)
-            self.logger.info("RabbitVideo Memory Summary")
-            self.logger.info("="*80)
-            self.logger.info(f"Peak Allocated Memory: {self.peak_allocated:.2f} GB")
-            self.logger.info(f"Peak Reserved Memory:  {self.peak_reserved:.2f} GB")
-            self.logger.info(f"Peak Cache Waste:      {self.peak_reserved - self.peak_allocated:.2f} GB")
-            self.logger.info("="*80 + "\n")
+            self.logger.debug("\n" + "="*80)
+            self.logger.debug("RabbitVideo Memory Summary")
+            self.logger.debug("="*80)
+            self.logger.debug(f"Peak Allocated Memory: {self.peak_allocated:.2f} GB")
+            self.logger.debug(f"Peak Reserved Memory:  {self.peak_reserved:.2f} GB")
+            self.logger.debug(f"Peak Cache Waste:      {self.peak_reserved - self.peak_allocated:.2f} GB")
+            self.logger.debug("="*80 + "\n")
 
 
 class BlockTracker:
@@ -188,7 +188,7 @@ class BlockTracker:
         blocks_to_offload = gpu_blocks_sorted[:num_needed]
 
         if self.debug and self.logger:
-            self.logger.info(f"[BlockTracker] Selected {len(blocks_to_offload)} blocks to offload: {blocks_to_offload}")
+            self.logger.debug(f"[BlockTracker] Selected {len(blocks_to_offload)} blocks to offload: {blocks_to_offload}")
 
         return blocks_to_offload
 
@@ -217,11 +217,11 @@ class BlockTracker:
     def print_statistics(self):
         """Print transfer statistics."""
         if self.logger:
-            self.logger.info(f"[BlockTracker] Total Transfers: {self.total_transfers}")
-            self.logger.info(f"[BlockTracker] Total Transfer Time: {self.total_transfer_time:.2f}s")
+            self.logger.debug(f"[BlockTracker] Total Transfers: {self.total_transfers}")
+            self.logger.debug(f"[BlockTracker] Total Transfer Time: {self.total_transfer_time:.2f}s")
             if self.total_transfers > 0:
                 avg_time = self.total_transfer_time / self.total_transfers
-                self.logger.info(f"[BlockTracker] Average Transfer Time: {avg_time*1000:.1f}ms")
+                self.logger.debug(f"[BlockTracker] Average Transfer Time: {avg_time*1000:.1f}ms")
 
 
 class BlockManager:
@@ -257,7 +257,7 @@ class BlockManager:
 
         if self.debug and self.logger:
             before_alloc, before_reserved, _ = self.memory_monitor.get_current_memory()
-            self.logger.info(f"[BlockManager] Offloading block {block_idx} to CPU | "
+            self.logger.debug(f"[BlockManager] Offloading block {block_idx} to CPU | "
                        f"Before: Alloc={before_alloc:.2f}GB, Reserved={before_reserved:.2f}GB")
 
         # Synchronous transfer protocol with AGGRESSIVE cache clearing
@@ -277,7 +277,7 @@ class BlockManager:
 
         if self.debug and self.logger:
             after_alloc, after_reserved, _ = self.memory_monitor.get_current_memory()
-            self.logger.info(f"[BlockManager] Offloaded block {block_idx} in {elapsed*1000:.1f}ms | "
+            self.logger.debug(f"[BlockManager] Offloaded block {block_idx} in {elapsed*1000:.1f}ms | "
                        f"After: Alloc={after_alloc:.2f}GB, Reserved={after_reserved:.2f}GB | "
                        f"Freed: {before_reserved - after_reserved:.2f}GB")
 
@@ -293,7 +293,7 @@ class BlockManager:
         if self.debug and self.logger:
             before_alloc, before_reserved, _ = self.memory_monitor.get_current_memory()
             block_size = self.tracker.get_block_size(block_idx)
-            self.logger.info(f"[BlockManager] Loading block {block_idx} to GPU | "
+            self.logger.debug(f"[BlockManager] Loading block {block_idx} to GPU | "
                        f"Size: {block_size:.2f}GB | "
                        f"Before: Alloc={before_alloc:.2f}GB, Reserved={before_reserved:.2f}GB")
 
@@ -310,7 +310,7 @@ class BlockManager:
 
         if self.debug and self.logger:
             after_alloc, after_reserved, _ = self.memory_monitor.get_current_memory()
-            self.logger.info(f"[BlockManager] Loaded block {block_idx} in {elapsed*1000:.1f}ms | "
+            self.logger.debug(f"[BlockManager] Loaded block {block_idx} in {elapsed*1000:.1f}ms | "
                        f"After: Alloc={after_alloc:.2f}GB, Reserved={after_reserved:.2f}GB | "
                        f"Increased: {after_reserved - before_reserved:.2f}GB")
 
@@ -331,14 +331,14 @@ class BlockManager:
 
         if available_gb >= required_gb:
             if self.debug and self.logger:
-                self.logger.info(f"[BlockManager] Sufficient memory available: {available_gb:.2f}GB >= {required_gb:.2f}GB")
+                self.logger.debug(f"[BlockManager] Sufficient memory available: {available_gb:.2f}GB >= {required_gb:.2f}GB")
             return
 
         # Calculate how much we need to free
         need_to_free_gb = required_gb - available_gb + 0.5  # +0.5GB extra buffer (reduced from 1GB)
 
         if self.debug and self.logger:
-            self.logger.info(f"[BlockManager] Need to free {need_to_free_gb:.2f}GB | "
+            self.logger.debug(f"[BlockManager] Need to free {need_to_free_gb:.2f}GB | "
                        f"Current: Alloc={current_alloc:.2f}GB, Reserved={current_reserved:.2f}GB, Cache={cache:.2f}GB | "
                        f"GPU capacity: {gpu_capacity_gb:.2f}GB")
 
@@ -368,7 +368,7 @@ class BlockManager:
         actual_freed = current_reserved - after_reserved
 
         if self.debug and self.logger:
-            self.logger.info(f"[BlockManager] Freed {actual_freed:.2f}GB by offloading {len(blocks_to_offload)} blocks")
+            self.logger.debug(f"[BlockManager] Freed {actual_freed:.2f}GB by offloading {len(blocks_to_offload)} blocks")
 
 
 class RabbitVideoOffloader:
@@ -437,12 +437,12 @@ class RabbitVideoOffloader:
         self.prefetch_enabled = not stateless
 
         if self.logger:
-            self.logger.info(f"[RabbitVideo] Initialized with {self.num_blocks} blocks "
+            self.logger.debug(f"[RabbitVideo] Initialized with {self.num_blocks} blocks "
                            f"({len(self.double_blocks)} double + {len(self.single_blocks)} single)")
             if self.stateless:
-                self.logger.info(f"[RabbitVideo] STATELESS MODE: Zero blocks persist on GPU (absolute minimal memory)")
+                self.logger.debug(f"[RabbitVideo] STATELESS MODE: Zero blocks persist on GPU (absolute minimal memory)")
             else:
-                self.logger.info(f"[RabbitVideo] Will keep {self.blocks_to_keep} blocks on GPU (minimal memory mode)")
+                self.logger.debug(f"[RabbitVideo] Will keep {self.blocks_to_keep} blocks on GPU (minimal memory mode)")
 
     def initialize_offloading(self):
         """
@@ -454,7 +454,7 @@ class RabbitVideoOffloader:
             - Calculate block sizes for accurate memory estimation
         """
         if self.logger:
-            self.logger.info(f"[RabbitVideo] Phase 1: Proactive offloading initialization")
+            self.logger.debug(f"[RabbitVideo] Phase 1: Proactive offloading initialization")
         self.memory_monitor.record(blocks_on_gpu=len(self.tracker.gpu_blocks), current_block=-1)
 
         # First, calculate block sizes
@@ -463,7 +463,7 @@ class RabbitVideoOffloader:
 
         avg_size = self.tracker.average_block_size
         if self.logger:
-            self.logger.info(f"[RabbitVideo] Average block size: {avg_size:.2f}GB")
+            self.logger.debug(f"[RabbitVideo] Average block size: {avg_size:.2f}GB")
 
         # Decide which blocks to keep on GPU
         if self.stateless:
@@ -471,14 +471,14 @@ class RabbitVideoOffloader:
             blocks_to_keep_on_gpu = set()
             blocks_to_offload = set(range(self.num_blocks))
             if self.logger:
-                self.logger.info(f"[RabbitVideo] STATELESS: Offloading ALL {self.num_blocks} blocks to CPU")
+                self.logger.debug(f"[RabbitVideo] STATELESS: Offloading ALL {self.num_blocks} blocks to CPU")
         else:
             # MINIMAL: Keep only 1 block on GPU
             blocks_to_keep_on_gpu = set(range(min(self.blocks_to_keep, 1)))
             blocks_to_offload = set(range(self.num_blocks)) - blocks_to_keep_on_gpu
             if self.logger:
-                self.logger.info(f"[RabbitVideo] Keeping blocks {list(blocks_to_keep_on_gpu)} on GPU")
-                self.logger.info(f"[RabbitVideo] Offloading {len(blocks_to_offload)} blocks to CPU")
+                self.logger.debug(f"[RabbitVideo] Keeping blocks {list(blocks_to_keep_on_gpu)} on GPU")
+                self.logger.debug(f"[RabbitVideo] Offloading {len(blocks_to_offload)} blocks to CPU")
 
         # Offload blocks not in the initial set
         for block_idx in sorted(blocks_to_offload):
@@ -501,10 +501,10 @@ class RabbitVideoOffloader:
         # Print initial memory state
         alloc, reserved, cache = self.memory_monitor.get_current_memory()
         if self.logger:
-            self.logger.info(f"[RabbitVideo] After initialization: "
+            self.logger.debug(f"[RabbitVideo] After initialization: "
                            f"Allocated={alloc:.2f}GB, Reserved={reserved:.2f}GB, Cache={cache:.2f}GB")
             if self.stateless:
-                self.logger.info(f"[RabbitVideo] STATELESS: Zero blocks on GPU, will load on-demand")
+                self.logger.debug(f"[RabbitVideo] STATELESS: Zero blocks on GPU, will load on-demand")
 
     def ensure_block_on_gpu(self, block_idx: int):
         """
@@ -524,7 +524,7 @@ class RabbitVideoOffloader:
         if self.tracker.previous_block is not None and self.tracker.previous_block != block_idx:
             if self.tracker.is_on_gpu(self.tracker.previous_block):
                 if self.debug and self.logger:
-                    self.logger.info(f"[RabbitVideo] Offloading previous block {self.tracker.previous_block}")
+                    self.logger.debug(f"[RabbitVideo] Offloading previous block {self.tracker.previous_block}")
                 prev_block = self.blocks_dict[self.tracker.previous_block]
                 self.block_manager.move_block_to_cpu(prev_block, self.tracker.previous_block)
                 # Aggressive cache clear after offloading
@@ -533,13 +533,13 @@ class RabbitVideoOffloader:
         # If already on GPU, nothing more to do
         if self.tracker.is_on_gpu(block_idx):
             if self.debug and self.logger:
-                self.logger.info(f"[RabbitVideo] Block {block_idx} already on GPU")
+                self.logger.debug(f"[RabbitVideo] Block {block_idx} already on GPU")
             self.tracker.current_executing_block = block_idx
             self.tracker.previous_block = block_idx
             return
 
         if self.debug and self.logger:
-            self.logger.info(f"[RabbitVideo] Block {block_idx} needs to be loaded to GPU")
+            self.logger.debug(f"[RabbitVideo] Block {block_idx} needs to be loaded to GPU")
 
         # Get block and its size
         block = self.blocks_dict[block_idx]
@@ -584,7 +584,7 @@ class RabbitVideoOffloader:
         available = gpu_capacity - reserved
         if available >= block_size + 2.0:
             if self.debug and self.logger:
-                self.logger.info(f"[RabbitVideo] Prefetching block {block_idx} | Available: {available:.2f}GB")
+                self.logger.debug(f"[RabbitVideo] Prefetching block {block_idx} | Available: {available:.2f}GB")
             block = self.blocks_dict[block_idx]
             self.block_manager.move_block_to_gpu(block, block_idx)
 
@@ -602,7 +602,7 @@ class RabbitVideoOffloader:
             return  # Already offloaded
 
         if self.debug and self.logger:
-            self.logger.info(f"[RabbitVideo] STATELESS: Offloading block {block_idx} after execution")
+            self.logger.debug(f"[RabbitVideo] STATELESS: Offloading block {block_idx} after execution")
 
         block = self.blocks_dict[block_idx]
         self.block_manager.move_block_to_cpu(block, block_idx)
@@ -630,7 +630,7 @@ class RabbitVideoOffloader:
 
         if self.debug and self.logger:
             alloc, reserved, cache = self.memory_monitor.get_current_memory()
-            self.logger.info(f"[RabbitVideo] Cache cleared after block | "
+            self.logger.debug(f"[RabbitVideo] Cache cleared after block | "
                            f"Alloc={alloc:.2f}GB, Reserved={reserved:.2f}GB, Cache={cache:.2f}GB")
 
     def step_begin(self, step: int, total_steps: int):
@@ -639,7 +639,7 @@ class RabbitVideoOffloader:
         self.total_steps = total_steps
         if self.debug and self.logger:
             alloc, reserved, cache = self.memory_monitor.get_current_memory()
-            self.logger.info(f"\n[RabbitVideo] === Step {step}/{total_steps} START === | "
+            self.logger.debug(f"\n[RabbitVideo] === Step {step}/{total_steps} START === | "
                            f"Alloc={alloc:.2f}GB, Reserved={reserved:.2f}GB, Cache={cache:.2f}GB")
 
     def step_end(self):
@@ -655,7 +655,7 @@ class RabbitVideoOffloader:
 
         if self.debug and self.logger:
             alloc, reserved, cache = self.memory_monitor.get_current_memory()
-            self.logger.info(f"[RabbitVideo] === Step {self.current_step}/{self.total_steps} END === | "
+            self.logger.debug(f"[RabbitVideo] === Step {self.current_step}/{self.total_steps} END === | "
                            f"Alloc={alloc:.2f}GB, Reserved={reserved:.2f}GB, Cache={cache:.2f}GB | "
                            f"Blocks on GPU: {len(self.tracker.gpu_blocks)}")
 
@@ -683,7 +683,7 @@ def offload_auxiliary_models_to_cpu(vae, text_encoder, text_encoder_2=None, logg
     GPU memory during transformer inference.
     """
     if logger:
-        logger.info("[RabbitVideo] Phase 3: Offloading auxiliary models to CPU")
+        logger.debug("[RabbitVideo] Phase 3: Offloading auxiliary models to CPU")
 
     if vae is not None and hasattr(vae, 'to'):
         vae.to('cpu')
@@ -691,7 +691,7 @@ def offload_auxiliary_models_to_cpu(vae, text_encoder, text_encoder_2=None, logg
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         if logger:
-            logger.info("[RabbitVideo] VAE moved to CPU")
+            logger.debug("[RabbitVideo] VAE moved to CPU")
 
     if text_encoder is not None and hasattr(text_encoder, 'to'):
         text_encoder.to('cpu')
@@ -699,7 +699,7 @@ def offload_auxiliary_models_to_cpu(vae, text_encoder, text_encoder_2=None, logg
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         if logger:
-            logger.info("[RabbitVideo] Text encoder moved to CPU")
+            logger.debug("[RabbitVideo] Text encoder moved to CPU")
 
     if text_encoder_2 is not None and hasattr(text_encoder_2, 'to'):
         text_encoder_2.to('cpu')
@@ -707,7 +707,7 @@ def offload_auxiliary_models_to_cpu(vae, text_encoder, text_encoder_2=None, logg
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         if logger:
-            logger.info("[RabbitVideo] Text encoder 2 moved to CPU")
+            logger.debug("[RabbitVideo] Text encoder 2 moved to CPU")
 
 
 def temporarily_move_to_gpu(model, device, operation_name: str = "operation", logger=None):
@@ -721,14 +721,14 @@ def temporarily_move_to_gpu(model, device, operation_name: str = "operation", lo
     class TempGPUContext:
         def __enter__(self):
             if logger:
-                logger.info(f"[RabbitVideo] Temporarily moving model to GPU for {operation_name}")
+                logger.debug(f"[RabbitVideo] Temporarily moving model to GPU for {operation_name}")
             model.to(device)
             torch.cuda.synchronize()
             return model
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             if logger:
-                logger.info(f"[RabbitVideo] Moving model back to CPU after {operation_name}")
+                logger.debug(f"[RabbitVideo] Moving model back to CPU after {operation_name}")
             model.to('cpu')
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
