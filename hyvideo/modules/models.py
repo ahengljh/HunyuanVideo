@@ -42,6 +42,8 @@ class MMDoubleStreamBlock(nn.Module):
 
         self.deterministic = False
         self.heads_num = heads_num
+        self.block_idx = None  # Will be set by model during initialization
+        self.kv_cache_manager = None  # Will be set if KV cache is enabled
         head_dim = hidden_size // heads_num
         mlp_hidden_dim = int(hidden_size * mlp_width_ratio)
 
@@ -195,10 +197,18 @@ class MMDoubleStreamBlock(nn.Module):
         q = torch.cat((img_q, txt_q), dim=1)
         k = torch.cat((img_k, txt_k), dim=1)
         v = torch.cat((img_v, txt_v), dim=1)
+
+        # Apply KV cache if available
+        if self.kv_cache_manager is not None and self.block_idx is not None:
+            # The cache manager will handle KV caching based on static region detection
+            q, k, v = self.kv_cache_manager.process_kv_with_cache(
+                self.block_idx, q, k, v
+            )
+
         assert (
             cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
-        
+
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
             attn = attention(
@@ -278,6 +288,8 @@ class MMSingleStreamBlock(nn.Module):
         self.deterministic = False
         self.hidden_size = hidden_size
         self.heads_num = heads_num
+        self.block_idx = None  # Will be set by model during initialization
+        self.kv_cache_manager = None  # Will be set if KV cache is enabled
         head_dim = hidden_size // heads_num
         mlp_hidden_dim = int(hidden_size * mlp_width_ratio)
         self.mlp_hidden_dim = mlp_hidden_dim
@@ -358,11 +370,18 @@ class MMSingleStreamBlock(nn.Module):
             q = torch.cat((img_q, txt_q), dim=1)
             k = torch.cat((img_k, txt_k), dim=1)
 
+        # Apply KV cache if available
+        if self.kv_cache_manager is not None and self.block_idx is not None:
+            # The cache manager will handle KV caching based on static region detection
+            q, k, v = self.kv_cache_manager.process_kv_with_cache(
+                self.block_idx, q, k, v
+            )
+
         # Compute attention.
         assert (
             cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
-        
+
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
             attn = attention(
@@ -580,6 +599,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+        # Initialize block indices for KV cache tracking
+        for i, block in enumerate(self.double_blocks):
+            block.block_idx = i
+        for i, block in enumerate(self.single_blocks):
+            block.block_idx = len(self.double_blocks) + i
+
+        # KV cache manager will be set by RabbitVideoOffloader if enabled
+        self.kv_cache_manager = None
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -591,6 +619,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             block.disable_deterministic()
         for block in self.single_blocks:
             block.disable_deterministic()
+
+    def set_kv_cache_manager(self, kv_cache_manager):
+        """Set the KV cache manager for all blocks."""
+        self.kv_cache_manager = kv_cache_manager
+        # Propagate to all blocks
+        for block in self.double_blocks:
+            block.kv_cache_manager = kv_cache_manager
+        for block in self.single_blocks:
+            block.kv_cache_manager = kv_cache_manager
 
     def forward(
         self,

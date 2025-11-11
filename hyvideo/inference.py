@@ -18,6 +18,11 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.modules.fp8_optimization import convert_fp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
+from hyvideo.rabbit_video import (
+    RabbitVideoOffloader,
+    offload_auxiliary_models_to_cpu,
+    temporarily_move_to_gpu
+)
 
 try:
     import xfuser
@@ -35,6 +40,110 @@ except:
     get_sp_group = None
     initialize_model_parallel = None
     init_distributed_environment = None
+
+
+def _normalize_device(device):
+    """Convert assorted device representations into ``torch.device`` objects."""
+    if isinstance(device, torch.device):
+        return device
+    if device is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, str):
+        return torch.device(device)
+    if isinstance(device, int):
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{device}")
+        return torch.device("cpu")
+    return torch.device(device)
+
+
+def _move_support_modules_to_device(model, device: torch.device):
+    """Move non-block transformer components to the target device."""
+    support_attrs = [
+        "img_in",
+        "txt_in",
+        "time_in",
+        "vector_in",
+        "guidance_in",
+        "final_layer",
+    ]
+    for attr in support_attrs:
+        module = getattr(model, attr, None)
+        if module is None:
+            continue
+        module.to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+
+def wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger_instance):
+    """
+    Wrap transformer forward pass to enable RabbitVideo block swapping.
+
+    This function intercepts block execution to ensure each block is loaded
+    to GPU before execution using the RabbitVideoOffloader, with aggressive
+    cache clearing after each block.
+
+    In STATELESS mode, blocks are immediately offloaded after execution,
+    ensuring zero blocks persist on GPU between executions.
+    """
+    stateless_mode = rabbit_offloader.stateless
+
+    # Wrap double blocks
+    for block_idx, block in enumerate(model.double_blocks):
+        original_forward = block.forward
+
+        def make_wrapped_forward(orig_forward, idx):
+            @functools.wraps(orig_forward)
+            def wrapped_forward(*args, **kwargs):
+                # Load: Ensure block is on GPU before execution
+                rabbit_offloader.ensure_block_on_gpu(idx)
+
+                # Execute: Run the block's forward pass
+                result = orig_forward(*args, **kwargs)
+
+                # Offload: In stateless mode, immediately offload after execution
+                if stateless_mode:
+                    rabbit_offloader.offload_block_after_execution(idx)
+
+                # Clear cache aggressively
+                rabbit_offloader.clear_cache_after_block()
+
+                return result
+            return wrapped_forward
+
+        block.forward = make_wrapped_forward(original_forward, block_idx)
+
+    # Wrap single blocks (offset by number of double blocks)
+    num_double_blocks = len(model.double_blocks)
+    for block_idx, block in enumerate(model.single_blocks):
+        original_forward = block.forward
+        global_block_idx = num_double_blocks + block_idx
+
+        def make_wrapped_forward(orig_forward, idx):
+            @functools.wraps(orig_forward)
+            def wrapped_forward(*args, **kwargs):
+                # Load: Ensure block is on GPU before execution
+                rabbit_offloader.ensure_block_on_gpu(idx)
+
+                # Execute: Run the block's forward pass
+                result = orig_forward(*args, **kwargs)
+
+                # Offload: In stateless mode, immediately offload after execution
+                if stateless_mode:
+                    rabbit_offloader.offload_block_after_execution(idx)
+
+                # Clear cache aggressively
+                rabbit_offloader.clear_cache_after_block()
+
+                return result
+            return wrapped_forward
+
+        block.forward = make_wrapped_forward(original_forward, global_block_idx)
+
+    if logger_instance:
+        mode_str = "STATELESS" if stateless_mode else "MINIMAL"
+        logger_instance.info(f"[RabbitVideo] Wrapped {len(model.double_blocks) + len(model.single_blocks)} transformer blocks ({mode_str} mode)")
 
 
 def parallelize_transformer(pipe):
@@ -118,6 +227,8 @@ class Inference(object):
         device=None,
         logger=None,
         parallel_args=None,
+        rabbit_offloader=None,
+        memory_monitor=None,
     ):
         self.vae = vae
         self.vae_kwargs = vae_kwargs
@@ -128,15 +239,11 @@ class Inference(object):
         self.model = model
         self.pipeline = pipeline
         self.use_cpu_offload = use_cpu_offload
+        self.rabbit_offloader = rabbit_offloader
+        self.memory_monitor = memory_monitor
 
         self.args = args
-        self.device = (
-            device
-            if device is not None
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        self.device = _normalize_device(device)
         self.logger = logger
         self.parallel_args = parallel_args
 
@@ -178,6 +285,8 @@ class Inference(object):
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        device = _normalize_device(device)
+
         parallel_args = {"ulysses_degree": args.ulysses_degree, "ring_degree": args.ring_degree}
 
         # ======================== Get the args path =============================
@@ -187,7 +296,8 @@ class Inference(object):
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
+        transformer_init_device = torch.device("cpu") if getattr(args, 'rabbit_mode', False) else device
+        factor_kwargs = {"device": transformer_init_device, "dtype": PRECISION_TO_TYPE[args.precision]}
         in_channels = args.latent_channels
         out_channels = args.latent_channels
 
@@ -199,17 +309,24 @@ class Inference(object):
         )
         if args.use_fp8:
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
-        model = model.to(device)
+        if getattr(args, 'rabbit_mode', False):
+            model = model.to(torch.device("cpu"))
+        else:
+            model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
 
+        if getattr(args, 'rabbit_mode', False):
+            _move_support_modules_to_device(model, device)
+
         # ============================= Build extra models ========================
         # VAE
+        vae_device = "cpu" if (args.use_cpu_offload or getattr(args, 'rabbit_mode', False)) else device
         vae, _, s_ratio, t_ratio = load_vae(
             args.vae,
             args.vae_precision,
             logger=logger,
-            device=device if not args.use_cpu_offload else "cpu",
+            device=vae_device,
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
 
@@ -238,6 +355,7 @@ class Inference(object):
             else None
         )
 
+        text_encoder_device = "cpu" if (args.use_cpu_offload or getattr(args, 'rabbit_mode', False)) else device
         text_encoder = TextEncoder(
             text_encoder_type=args.text_encoder,
             max_length=max_length,
@@ -249,7 +367,7 @@ class Inference(object):
             apply_final_norm=args.apply_final_norm,
             reproduce=args.reproduce,
             logger=logger,
-            device=device if not args.use_cpu_offload else "cpu",
+            device=text_encoder_device,
         )
         text_encoder_2 = None
         if args.text_encoder_2 is not None:
@@ -260,8 +378,69 @@ class Inference(object):
                 tokenizer_type=args.tokenizer_2,
                 reproduce=args.reproduce,
                 logger=logger,
-                device=device if not args.use_cpu_offload else "cpu",
+                device=text_encoder_device,
             )
+
+        # ========================= Memory Timeline Monitoring ====================
+        # Standalone memory monitoring (works with or without RabbitVideo)
+        memory_monitor = None
+        save_timeline_path = getattr(args, 'save_memory_timeline', '')
+        if save_timeline_path:
+            from hyvideo.rabbit_video import MemoryMonitor
+            memory_monitor = MemoryMonitor(device=device, debug=False, logger=logger)
+            logger.info(f"Memory timeline monitoring enabled. Will save to: {save_timeline_path}")
+            # Record initial state
+            memory_monitor.record(blocks_on_gpu=0, current_block=-1)
+
+        # ========================= RabbitVideo Initialization ====================
+        rabbit_offloader = None
+        if getattr(args, 'rabbit_mode', False):
+            logger.debug("=" * 80)
+            logger.debug("RabbitVideo: Memory-Efficient Video Diffusion via Strategic Block Offloading")
+            logger.debug("=" * 80)
+
+            # Validate rabbit mode is compatible with distributed settings
+            if args.ulysses_degree > 1 or args.ring_degree > 1:
+                raise ValueError("RabbitVideo mode is not compatible with distributed inference. "
+                               "Please disable --rabbit-mode or set ulysses/ring degrees to 1.")
+
+            # Determine blocks to keep on GPU
+            # NEW DEFAULT: Keep only 1 block on GPU for minimal memory usage
+            DEFAULT_BLOCKS_TO_KEEP = 1  # Changed from 5 to 1 for minimal memory
+            AGGRESSIVE_BLOCKS_TO_KEEP = 1  # Same as default now
+            rabbit_aggressive = getattr(args, 'rabbit_aggressive_offload', False)
+            rabbit_debug = getattr(args, 'rabbit_debug', False)
+            blocks_to_keep = DEFAULT_BLOCKS_TO_KEEP  # Always use minimal mode
+
+            rabbit_stateless = getattr(args, 'rabbit_stateless', False)
+
+            logger.info(f"Initializing RabbitVideo with {blocks_to_keep} blocks on GPU (minimal memory mode)...")
+            logger.info(f"Aggressive offload mode (deprecated, now always minimal): {rabbit_aggressive}")
+            logger.info(f"Debug mode: {rabbit_debug}")
+            logger.info(f"Stateless mode (recomputation): {rabbit_stateless}")
+
+            # Initialize RabbitVideo offloader
+            # If standalone memory monitor exists, RabbitVideo will use it; otherwise creates its own
+            rabbit_offloader = RabbitVideoOffloader(
+                model=model,
+                device=device,
+                blocks_to_keep=blocks_to_keep,
+                debug=rabbit_debug,
+                logger=logger,
+                stateless=rabbit_stateless,
+                enable_kv_cache=getattr(args, 'rabbit_kv_cache', False),
+                kv_cache_threshold=getattr(args, 'rabbit_kv_threshold', 0.05),
+                kv_cache_max_memory_gb=getattr(args, 'rabbit_kv_max_gb', 0.5)
+            )
+
+            # Phase 1: Smart initialization with proactive offloading
+            rabbit_offloader.initialize_offloading()
+
+            # Phase 2: Wrap transformer blocks for dynamic swapping
+            wrap_transformer_with_rabbit_video(model, rabbit_offloader, logger)
+
+            logger.info("RabbitVideo initialization complete.")
+            logger.info("=" * 80)
 
         return cls(
             args=args,
@@ -273,7 +452,9 @@ class Inference(object):
             use_cpu_offload=args.use_cpu_offload,
             device=device,
             logger=logger,
-            parallel_args=parallel_args
+            parallel_args=parallel_args,
+            rabbit_offloader=rabbit_offloader,
+            memory_monitor=memory_monitor
         )
 
     @staticmethod
@@ -379,7 +560,9 @@ class HunyuanVideoSampler(Inference):
         use_cpu_offload=False,
         device=0,
         logger=None,
-        parallel_args=None
+        parallel_args=None,
+        rabbit_offloader=None,
+        memory_monitor=None,
     ):
         super().__init__(
             args,
@@ -392,7 +575,9 @@ class HunyuanVideoSampler(Inference):
             use_cpu_offload=use_cpu_offload,
             device=device,
             logger=logger,
-            parallel_args=parallel_args
+            parallel_args=parallel_args,
+            rabbit_offloader=rabbit_offloader,
+            memory_monitor=memory_monitor,
         )
 
         self.pipeline = self.load_diffusion_pipeline(
@@ -431,6 +616,8 @@ class HunyuanVideoSampler(Inference):
             else:
                 raise ValueError(f"Invalid denoise type {args.denoise_type}")
 
+        target_device = _normalize_device(device)
+
         pipeline = HunyuanVideoPipeline(
             vae=vae,
             text_encoder=text_encoder,
@@ -439,11 +626,15 @@ class HunyuanVideoSampler(Inference):
             scheduler=scheduler,
             progress_bar_config=progress_bar_config,
             args=args,
+            memory_monitor=self.memory_monitor,
+            rabbit_offloader=self.rabbit_offloader,
         )
         if self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()
-        else:
-            pipeline = pipeline.to(device)
+        elif not getattr(args, 'rabbit_mode', False):
+            pipeline = pipeline.to(target_device)
+
+        pipeline.execution_device = target_device
 
         return pipeline
 
@@ -645,6 +836,11 @@ class HunyuanVideoSampler(Inference):
         # Pipeline inference
         # ========================================================================
         start_time = time.time()
+
+        # RabbitVideo: Record initial memory state
+        if self.rabbit_offloader is not None:
+            self.rabbit_offloader.memory_monitor.record()
+
         samples = self.pipeline(
             prompt=prompt,
             height=target_height,
@@ -669,5 +865,14 @@ class HunyuanVideoSampler(Inference):
 
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
+
+        # RabbitVideo: Print summary and save timeline
+        if self.rabbit_offloader is not None:
+            self.rabbit_offloader.print_summary()
+
+            # Save timeline if requested
+            timeline_path = getattr(self.args, 'rabbit_save_timeline', '')
+            if timeline_path:
+                self.rabbit_offloader.save_timeline(timeline_path)
 
         return out_dict
