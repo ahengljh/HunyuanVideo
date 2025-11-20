@@ -358,6 +358,16 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Enable reproducibility by setting random seeds and deterministic algorithms.",
     )
 
+    # KV-Cache optimization
+    group.add_argument(
+        "--enable-kv-cache",
+        action="store_true",
+        help="Enable step-to-step KV cache reuse to reduce computation. "
+        "Each timestep will reuse K,V from previous step (only compute Q). "
+        "This provides 20-30%% speedup but may slightly impact output quality. "
+        "Default: disabled for best quality.",
+    )
+
     return parser
 
 

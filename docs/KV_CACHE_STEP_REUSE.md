@@ -24,7 +24,7 @@
 
 ## 使用方法
 
-### 方法1：通过命令行参数（需要代码支持）
+### 方法1：通过命令行参数（推荐）
 
 ```bash
 python sample_video.py \
@@ -38,6 +38,16 @@ python sample_video.py \
     --save-path videos/ \
     --cfg-scale 6.0 \
     --enable-kv-cache  # 启用KV缓存
+```
+
+查看帮助信息：
+```bash
+python sample_video.py --help
+# 会看到:
+# --enable-kv-cache     Enable step-to-step KV cache reuse to reduce computation.
+#                       Each timestep will reuse K,V from previous step (only compute Q).
+#                       This provides 20-30% speedup but may slightly impact output quality.
+#                       Default: disabled for best quality.
 ```
 
 ### 方法2：通过代码设置
