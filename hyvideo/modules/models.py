@@ -140,15 +140,17 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
         cached_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (k, v) from previous step
+        need_cache: bool = False,  # Whether to return K,V for next step
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass with optional KV reuse from previous timestep.
 
         Args:
             cached_kv: Optional tuple of (k, v) from previous step to reuse
+            need_cache: Whether to return current K,V for caching
 
         Returns:
-            img, txt, (current_k, current_v) for next step to reuse
+            img, txt, (current_k, current_v) if need_cache else None
         """
         (
             img_mod1_shift,
@@ -297,8 +299,8 @@ class MMDoubleStreamBlock(nn.Module):
             gate=txt_mod2_gate,
         )
 
-        # Return current K,V for next step to reuse
-        return img, txt, (k, v)
+        # Return current K,V for next step to reuse (only if needed to save memory)
+        return img, txt, (k, v) if need_cache else None
 
 
 class MMSingleStreamBlock(nn.Module):
@@ -383,15 +385,17 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
         cached_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (k, v) from previous step
+        need_cache: bool = False,  # Whether to return K,V for next step
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass with optional KV reuse from previous timestep.
 
         Args:
             cached_kv: Optional tuple of (k, v) from previous step to reuse
+            need_cache: Whether to return current K,V for caching
 
         Returns:
-            x, (current_k, current_v) for next step to reuse
+            x, (current_k, current_v) if need_cache else None
         """
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
@@ -473,8 +477,8 @@ class MMSingleStreamBlock(nn.Module):
 
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        # Return current K,V for next step to reuse
-        return x + apply_gate(output, gate=mod_gate), (k, v)
+        # Return current K,V for next step to reuse (only if needed to save memory)
+        return x + apply_gate(output, gate=mod_gate), (k, v) if need_cache else None
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
@@ -770,11 +774,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 max_seqlen_kv,
                 freqs_cis,
                 cached_kv,  # Pass cached KV from previous step
+                use_kv_cache,  # Only return KV if caching is enabled
             ]
 
             img, txt, current_kv = block(*double_block_args)
 
-            # Save current KV for next step
+            # Save current KV for next step (will be None if use_kv_cache=False)
             if use_kv_cache:
                 new_cache_double.append(current_kv)
 
@@ -795,11 +800,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     max_seqlen_kv,
                     (freqs_cos, freqs_sin),
                     cached_kv,  # Pass cached KV from previous step
+                    use_kv_cache,  # Only return KV if caching is enabled
                 ]
 
                 x, current_kv = block(*single_block_args)
 
-                # Save current KV for next step
+                # Save current KV for next step (will be None if use_kv_cache=False)
                 if use_kv_cache:
                     new_cache_single.append(current_kv)
 
