@@ -358,6 +358,37 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Enable reproducibility by setting random seeds and deterministic algorithms.",
     )
 
+    # KV Cache Reuse
+    group.add_argument(
+        "--enable-kv-cache",
+        action="store_true",
+        help="Enable KV cache reuse mechanism to save computation by reusing KV for "
+        "regions with small changes between timesteps.",
+    )
+    group.add_argument(
+        "--kv-cache-threshold",
+        type=float,
+        default=0.1,
+        help="Threshold for determining when to reuse KV cache. Lower values mean stricter "
+        "requirements for reuse (less reuse but higher quality). Typical range: 0.05-0.2",
+    )
+    group.add_argument(
+        "--kv-cache-patch-size",
+        type=int,
+        nargs=3,
+        default=[1, 2, 2],
+        help="Patch size (T, H, W) for KV cache delta computation. Larger patches mean "
+        "coarser granularity but less overhead.",
+    )
+    group.add_argument(
+        "--kv-cache-aggregation",
+        type=str,
+        default="l2",
+        choices=["l2", "cosine", "mse"],
+        help="Method to compute change between patches: "
+        "'l2' (L2 norm), 'cosine' (cosine distance), 'mse' (mean squared error)",
+    )
+
     return parser
 
 

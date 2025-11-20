@@ -663,6 +663,10 @@ class HunyuanVideoSampler(Inference):
             is_progress_bar=True,
             vae_ver=self.args.vae,
             enable_tiling=self.args.vae_tiling,
+            enable_kv_cache=getattr(self.args, 'enable_kv_cache', False),
+            kv_cache_threshold=getattr(self.args, 'kv_cache_threshold', 0.1),
+            kv_cache_patch_size=tuple(getattr(self.args, 'kv_cache_patch_size', [1, 2, 2])),
+            kv_cache_aggregation=getattr(self.args, 'kv_cache_aggregation', 'l2'),
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt

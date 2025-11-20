@@ -47,6 +47,7 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
+from ...modules.kv_cache_utils import compute_latent_delta_mask, get_kv_cache_stats
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -699,6 +700,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         enable_tiling: bool = False,
         n_tokens: Optional[int] = None,
         embedded_guidance_scale: Optional[float] = None,
+        enable_kv_cache: bool = False,
+        kv_cache_threshold: float = 0.1,
+        kv_cache_patch_size: Tuple[int, int, int] = (1, 2, 2),
+        kv_cache_aggregation: str = "l2",
         **kwargs,
     ):
         r"""
@@ -956,6 +961,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # Enable KV cache if requested
+        if enable_kv_cache:
+            self.transformer.enable_kv_cache()
+            logger.info(f"KV cache enabled with threshold={kv_cache_threshold}, "
+                       f"patch_size={kv_cache_patch_size}, aggregation={kv_cache_aggregation}")
+        else:
+            self.transformer.disable_kv_cache()
+
+        # Track previous latents for delta computation
+        previous_latents = None
+        kv_cache_stats_list = []
+
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -984,6 +1001,30 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     else None
                 )
 
+                # Compute KV cache reuse mask based on latent delta
+                kv_reuse_mask = None
+                if enable_kv_cache:
+                    # Use the non-CFG latents for delta computation
+                    current_latents_for_delta = latents
+                    kv_reuse_mask = compute_latent_delta_mask(
+                        current_latents_for_delta,
+                        previous_latents,
+                        threshold=kv_cache_threshold,
+                        patch_size=kv_cache_patch_size,
+                        aggregation=kv_cache_aggregation,
+                    )
+
+                    # Expand mask for CFG if needed
+                    if self.do_classifier_free_guidance:
+                        kv_reuse_mask = kv_reuse_mask.repeat(2, 1)
+
+                    # Log stats for this step
+                    if i > 0:  # Skip first step since there's no previous latents
+                        stats = get_kv_cache_stats(kv_reuse_mask)
+                        kv_cache_stats_list.append(stats)
+                        if i % 10 == 0:  # Log every 10 steps
+                            logger.info(f"Step {i}: KV cache reuse ratio = {stats['reuse_ratio']:.2%}")
+
                 # predict the noise residual
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
@@ -997,6 +1038,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
                         freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
                         guidance=guidance_expand,
+                        kv_reuse_mask=kv_reuse_mask,
                         return_dict=True,
                     )[
                         "x"
@@ -1022,6 +1064,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                 )[0]
 
+                # Update previous latents for next step's delta computation
+                if enable_kv_cache:
+                    previous_latents = latents.detach().clone()
+
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
@@ -1043,6 +1089,19 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+        # Clean up KV cache and log statistics
+        if enable_kv_cache:
+            self.transformer.clear_kv_cache()
+            if len(kv_cache_stats_list) > 0:
+                avg_reuse_ratio = sum(s['reuse_ratio'] for s in kv_cache_stats_list) / len(kv_cache_stats_list)
+                total_patches = sum(s['total_patches'] for s in kv_cache_stats_list)
+                total_reused = sum(s['reused_patches'] for s in kv_cache_stats_list)
+                logger.info(f"KV cache statistics:")
+                logger.info(f"  Average reuse ratio: {avg_reuse_ratio:.2%}")
+                logger.info(f"  Total patches: {total_patches}")
+                logger.info(f"  Total reused: {total_reused}")
+                logger.info(f"  Total recomputed: {total_patches - total_reused}")
 
         if not output_type == "latent":
             expand_temporal_dim = False

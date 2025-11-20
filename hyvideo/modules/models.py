@@ -16,6 +16,7 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+from .kv_cache_utils import apply_kv_cache_mask
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -123,11 +124,30 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
+        # KV cache for reuse
+        self.kv_cache_enabled = False
+        self.register_buffer("cached_img_k", None, persistent=False)
+        self.register_buffer("cached_img_v", None, persistent=False)
+
     def enable_deterministic(self):
         self.deterministic = True
 
     def disable_deterministic(self):
         self.deterministic = False
+
+    def enable_kv_cache(self):
+        """Enable KV cache reuse mechanism"""
+        self.kv_cache_enabled = True
+
+    def disable_kv_cache(self):
+        """Disable KV cache reuse mechanism"""
+        self.kv_cache_enabled = False
+        self.clear_kv_cache()
+
+    def clear_kv_cache(self):
+        """Clear stored KV cache"""
+        self.cached_img_k = None
+        self.cached_img_v = None
 
     def forward(
         self,
@@ -139,6 +159,7 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
+        kv_reuse_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
             img_mod1_shift,
@@ -177,6 +198,20 @@ class MMDoubleStreamBlock(nn.Module):
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
             img_q, img_k = img_qq, img_kk
+
+        # Apply KV cache reuse if enabled
+        if self.kv_cache_enabled and kv_reuse_mask is not None:
+            img_k, img_v = apply_kv_cache_mask(
+                img_k, img_v,
+                self.cached_img_k, self.cached_img_v,
+                kv_reuse_mask,
+                img_len=img_k.shape[1]
+            )
+
+        # Store current img K/V for next step
+        if self.kv_cache_enabled:
+            self.cached_img_k = img_k.detach().clone()
+            self.cached_img_v = img_v.detach().clone()
 
         # Prepare txt for attention.
         txt_modulated = self.txt_norm1(txt)
@@ -317,11 +352,30 @@ class MMSingleStreamBlock(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
+        # KV cache for reuse
+        self.kv_cache_enabled = False
+        self.register_buffer("cached_k", None, persistent=False)
+        self.register_buffer("cached_v", None, persistent=False)
+
     def enable_deterministic(self):
         self.deterministic = True
 
     def disable_deterministic(self):
         self.deterministic = False
+
+    def enable_kv_cache(self):
+        """Enable KV cache reuse mechanism"""
+        self.kv_cache_enabled = True
+
+    def disable_kv_cache(self):
+        """Disable KV cache reuse mechanism"""
+        self.kv_cache_enabled = False
+        self.clear_kv_cache()
+
+    def clear_kv_cache(self):
+        """Clear stored KV cache"""
+        self.cached_k = None
+        self.cached_v = None
 
     def forward(
         self,
@@ -333,6 +387,7 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
+        kv_reuse_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
@@ -350,13 +405,61 @@ class MMSingleStreamBlock(nn.Module):
         if freqs_cis is not None:
             img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
             img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
+            img_v, txt_v = v[:, :-txt_len, :, :], v[:, -txt_len:, :, :]
             img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
             assert (
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
             img_q, img_k = img_qq, img_kk
+
+            # Apply KV cache reuse if enabled
+            if self.kv_cache_enabled and kv_reuse_mask is not None:
+                # For single stream, we need to extract img portion from cached k/v
+                if self.cached_k is not None and self.cached_v is not None:
+                    cached_img_k = self.cached_k[:, :-txt_len, :, :]
+                    cached_img_v = self.cached_v[:, :-txt_len, :, :]
+                else:
+                    cached_img_k = None
+                    cached_img_v = None
+
+                img_k, img_v = apply_kv_cache_mask(
+                    img_k, img_v,
+                    cached_img_k, cached_img_v,
+                    kv_reuse_mask,
+                    img_len=img_k.shape[1]
+                )
+
             q = torch.cat((img_q, txt_q), dim=1)
             k = torch.cat((img_k, txt_k), dim=1)
+            v = torch.cat((img_v, txt_v), dim=1)
+        else:
+            # No RoPE, still need to handle KV cache for img portion
+            if self.kv_cache_enabled and kv_reuse_mask is not None:
+                img_len = q.shape[1] - txt_len
+                img_k, img_v = k[:, :img_len], v[:, :img_len]
+                txt_k, txt_v = k[:, img_len:], v[:, img_len:]
+
+                if self.cached_k is not None and self.cached_v is not None:
+                    cached_img_k = self.cached_k[:, :img_len]
+                    cached_img_v = self.cached_v[:, :img_len]
+                else:
+                    cached_img_k = None
+                    cached_img_v = None
+
+                img_k, img_v = apply_kv_cache_mask(
+                    img_k, img_v,
+                    cached_img_k, cached_img_v,
+                    kv_reuse_mask,
+                    img_len=img_k.shape[1]
+                )
+
+                k = torch.cat((img_k, txt_k), dim=1)
+                v = torch.cat((img_v, txt_v), dim=1)
+
+        # Store current K/V for next step
+        if self.kv_cache_enabled:
+            self.cached_k = k.detach().clone()
+            self.cached_v = v.detach().clone()
 
         # Compute attention.
         assert (
@@ -592,6 +695,27 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         for block in self.single_blocks:
             block.disable_deterministic()
 
+    def enable_kv_cache(self):
+        """Enable KV cache reuse in all blocks"""
+        for block in self.double_blocks:
+            block.enable_kv_cache()
+        for block in self.single_blocks:
+            block.enable_kv_cache()
+
+    def disable_kv_cache(self):
+        """Disable KV cache reuse in all blocks"""
+        for block in self.double_blocks:
+            block.disable_kv_cache()
+        for block in self.single_blocks:
+            block.disable_kv_cache()
+
+    def clear_kv_cache(self):
+        """Clear KV cache in all blocks"""
+        for block in self.double_blocks:
+            block.clear_kv_cache()
+        for block in self.single_blocks:
+            block.clear_kv_cache()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -602,6 +726,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         freqs_cos: Optional[torch.Tensor] = None,
         freqs_sin: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
+        kv_reuse_mask: Optional[torch.Tensor] = None,  # KV cache reuse mask
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         out = {}
@@ -662,6 +787,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 max_seqlen_q,
                 max_seqlen_kv,
                 freqs_cis,
+                kv_reuse_mask,
             ]
 
             img, txt = block(*double_block_args)
@@ -679,6 +805,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     max_seqlen_q,
                     max_seqlen_kv,
                     (freqs_cos, freqs_sin),
+                    kv_reuse_mask,
                 ]
 
                 x = block(*single_block_args)
