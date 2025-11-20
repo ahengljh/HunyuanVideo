@@ -952,6 +952,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
 
+        # 6.5. KV-Cache configuration
+        # Enable step-to-step KV reuse: each step reuses K,V from previous step
+        # This reduces computation but may impact quality
+        from loguru import logger
+        use_kv_cache = getattr(self.args, 'enable_kv_cache', False)
+        if use_kv_cache:
+            logger.info("[KV-Cache] Enabled: Step-to-step KV reuse activated")
+            logger.info("[KV-Cache] Each step will reuse K,V from previous step (only compute Q)")
+            logger.info("[KV-Cache] This significantly reduces computation but may impact output quality")
+        else:
+            logger.info("[KV-Cache] Disabled: Standard computation (full Q,K,V each step)")
+
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -998,6 +1010,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
                         guidance=guidance_expand,
                         return_dict=True,
+                        use_kv_cache=use_kv_cache,  # Enable step-to-step KV reuse
                     )[
                         "x"
                     ]

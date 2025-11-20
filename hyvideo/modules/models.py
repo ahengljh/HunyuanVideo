@@ -139,7 +139,17 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cached_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (k, v) from previous step
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Forward pass with optional KV reuse from previous timestep.
+
+        Args:
+            cached_kv: Optional tuple of (k, v) from previous step to reuse
+
+        Returns:
+            img, txt, (current_k, current_v) for next step to reuse
+        """
         (
             img_mod1_shift,
             img_mod1_scale,
@@ -157,44 +167,82 @@ class MMDoubleStreamBlock(nn.Module):
             txt_mod2_gate,
         ) = self.txt_mod(vec).chunk(6, dim=-1)
 
-        # Prepare image for attention.
-        img_modulated = self.img_norm1(img)
-        img_modulated = modulate(
-            img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
-        )
-        img_qkv = self.img_attn_qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
-        )
-        # Apply QK-Norm if needed
-        img_q = self.img_attn_q_norm(img_q).to(img_v)
-        img_k = self.img_attn_k_norm(img_k).to(img_v)
+        # KV-Cache: Reuse K,V from previous step if available
+        if cached_kv is not None:
+            # Reuse K,V from previous timestep, only compute Q
+            cached_k, cached_v = cached_kv
 
-        # Apply RoPE if needed.
-        if freqs_cis is not None:
-            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
-            assert (
-                img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
-            ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
-            img_q, img_k = img_qq, img_kk
+            # Compute only Q for image
+            img_modulated = self.img_norm1(img)
+            img_modulated = modulate(
+                img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
+            )
+            img_qkv = self.img_attn_qkv(img_modulated)
+            img_q = rearrange(
+                img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )[0]  # Only take Q
+            img_q = self.img_attn_q_norm(img_q).to(cached_v)
 
-        # Prepare txt for attention.
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated = modulate(
-            txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale
-        )
-        txt_qkv = self.txt_attn_qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(
-            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
-        )
-        # Apply QK-Norm if needed.
-        txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
-        txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
+            # Apply RoPE to Q if needed
+            if freqs_cis is not None:
+                img_len = img.shape[1]
+                img_q_rotated, _ = apply_rotary_emb(img_q, img_q, freqs_cis, head_first=False)
+                img_q = img_q_rotated
 
-        # Run actual attention.
-        q = torch.cat((img_q, txt_q), dim=1)
-        k = torch.cat((img_k, txt_k), dim=1)
-        v = torch.cat((img_v, txt_v), dim=1)
+            # Compute only Q for text
+            txt_modulated = self.txt_norm1(txt)
+            txt_modulated = modulate(
+                txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale
+            )
+            txt_qkv = self.txt_attn_qkv(txt_modulated)
+            txt_q = rearrange(
+                txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )[0]  # Only take Q
+            txt_q = self.txt_attn_q_norm(txt_q).to(cached_v)
+
+            # Combine Q with cached K,V
+            q = torch.cat((img_q, txt_q), dim=1)
+            k, v = cached_k, cached_v
+        else:
+            # Normal path: compute Q,K,V
+            # Prepare image for attention.
+            img_modulated = self.img_norm1(img)
+            img_modulated = modulate(
+                img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
+            )
+            img_qkv = self.img_attn_qkv(img_modulated)
+            img_q, img_k, img_v = rearrange(
+                img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )
+            # Apply QK-Norm if needed
+            img_q = self.img_attn_q_norm(img_q).to(img_v)
+            img_k = self.img_attn_k_norm(img_k).to(img_v)
+
+            # Apply RoPE if needed.
+            if freqs_cis is not None:
+                img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+                assert (
+                    img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
+                ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
+                img_q, img_k = img_qq, img_kk
+
+            # Prepare txt for attention.
+            txt_modulated = self.txt_norm1(txt)
+            txt_modulated = modulate(
+                txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale
+            )
+            txt_qkv = self.txt_attn_qkv(txt_modulated)
+            txt_q, txt_k, txt_v = rearrange(
+                txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )
+            # Apply QK-Norm if needed.
+            txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
+            txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
+
+            # Run actual attention.
+            q = torch.cat((img_q, txt_q), dim=1)
+            k = torch.cat((img_k, txt_k), dim=1)
+            v = torch.cat((img_v, txt_v), dim=1)
         assert (
             cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
@@ -249,7 +297,8 @@ class MMDoubleStreamBlock(nn.Module):
             gate=txt_mod2_gate,
         )
 
-        return img, txt
+        # Return current K,V for next step to reuse
+        return img, txt, (k, v)
 
 
 class MMSingleStreamBlock(nn.Module):
@@ -333,30 +382,64 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
-    ) -> torch.Tensor:
+        cached_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (k, v) from previous step
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Forward pass with optional KV reuse from previous timestep.
+
+        Args:
+            cached_kv: Optional tuple of (k, v) from previous step to reuse
+
+        Returns:
+            x, (current_k, current_v) for next step to reuse
+        """
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
-        qkv, mlp = torch.split(
-            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
-        )
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+        # KV-Cache: Reuse K,V from previous step if available
+        if cached_kv is not None:
+            # Reuse K,V from previous timestep, only compute Q
+            cached_k, cached_v = cached_kv
 
-        # Apply QK-Norm if needed.
-        q = self.q_norm(q).to(v)
-        k = self.k_norm(k).to(v)
+            # Compute only Q and MLP
+            qkv, mlp = torch.split(
+                self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
+            )
+            q = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)[0]  # Only take Q
+            q = self.q_norm(q).to(cached_v)
 
-        # Apply RoPE if needed.
-        if freqs_cis is not None:
-            img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
-            img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
-            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
-            assert (
-                img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
-            ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
-            img_q, img_k = img_qq, img_kk
-            q = torch.cat((img_q, txt_q), dim=1)
-            k = torch.cat((img_k, txt_k), dim=1)
+            # Apply RoPE to Q if needed
+            if freqs_cis is not None:
+                img_q = q[:, :-txt_len, :, :]
+                txt_q = q[:, -txt_len:, :, :]
+                img_q_rotated, _ = apply_rotary_emb(img_q, img_q, freqs_cis, head_first=False)
+                img_q = img_q_rotated
+                q = torch.cat((img_q, txt_q), dim=1)
+
+            k, v = cached_k, cached_v
+        else:
+            # Normal path: compute Q,K,V
+            qkv, mlp = torch.split(
+                self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
+            )
+
+            q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+
+            # Apply QK-Norm if needed.
+            q = self.q_norm(q).to(v)
+            k = self.k_norm(k).to(v)
+
+            # Apply RoPE if needed.
+            if freqs_cis is not None:
+                img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
+                img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
+                img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+                assert (
+                    img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
+                ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
+                img_q, img_k = img_qq, img_kk
+                q = torch.cat((img_q, txt_q), dim=1)
+                k = torch.cat((img_k, txt_k), dim=1)
 
         # Compute attention.
         assert (
@@ -390,7 +473,8 @@ class MMSingleStreamBlock(nn.Module):
 
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + apply_gate(output, gate=mod_gate)
+        # Return current K,V for next step to reuse
+        return x + apply_gate(output, gate=mod_gate), (k, v)
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
@@ -580,6 +664,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+        # KV-Cache state for step-to-step reuse
+        # Stores K,V from previous timestep for each block
+        self._kv_cache_double = None  # List of (k, v) tuples for double blocks
+        self._kv_cache_single = None  # List of (k, v) tuples for single blocks
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -603,6 +692,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         freqs_sin: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
         return_dict: bool = True,
+        use_kv_cache: bool = False,  # Enable step-to-step KV reuse
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         out = {}
         img = x
@@ -651,8 +741,25 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         max_seqlen_kv = max_seqlen_q
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+
+        # KV-Cache management for step-to-step reuse
+        if use_kv_cache:
+            # Initialize cache lists if this is first use
+            if self._kv_cache_double is None:
+                self._kv_cache_double = [None] * len(self.double_blocks)
+                self._kv_cache_single = [None] * len(self.single_blocks)
+            new_cache_double = []
+            new_cache_single = []
+        else:
+            # Clear cache if not using it
+            self._kv_cache_double = None
+            self._kv_cache_single = None
+
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
+        for block_idx, block in enumerate(self.double_blocks):
+            # Get cached KV from previous step if available
+            cached_kv = self._kv_cache_double[block_idx] if use_kv_cache else None
+
             double_block_args = [
                 img,
                 txt,
@@ -662,14 +769,22 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 max_seqlen_q,
                 max_seqlen_kv,
                 freqs_cis,
+                cached_kv,  # Pass cached KV from previous step
             ]
 
-            img, txt = block(*double_block_args)
+            img, txt, current_kv = block(*double_block_args)
+
+            # Save current KV for next step
+            if use_kv_cache:
+                new_cache_double.append(current_kv)
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
         if len(self.single_blocks) > 0:
-            for _, block in enumerate(self.single_blocks):
+            for block_idx, block in enumerate(self.single_blocks):
+                # Get cached KV from previous step if available
+                cached_kv = self._kv_cache_single[block_idx] if use_kv_cache else None
+
                 single_block_args = [
                     x,
                     vec,
@@ -679,9 +794,19 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     max_seqlen_q,
                     max_seqlen_kv,
                     (freqs_cos, freqs_sin),
+                    cached_kv,  # Pass cached KV from previous step
                 ]
 
-                x = block(*single_block_args)
+                x, current_kv = block(*single_block_args)
+
+                # Save current KV for next step
+                if use_kv_cache:
+                    new_cache_single.append(current_kv)
+
+        # Update cache with current step's KV for next step to use
+        if use_kv_cache:
+            self._kv_cache_double = new_cache_double
+            self._kv_cache_single = new_cache_single
 
         img = x[:, :img_seq_len, ...]
 
