@@ -275,7 +275,12 @@ class MMDoubleStreamBlock(nn.Module):
             
         # attention computation end
 
+        # Cache K,V if needed, then immediately free memory
+        kv_cache = (k, v) if need_cache else None
+        del k, v
+
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1] :]
+        del attn  # Free attention output after splitting
 
         # Calculate the img bloks.
         img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
@@ -300,7 +305,7 @@ class MMDoubleStreamBlock(nn.Module):
         )
 
         # Return current K,V for next step to reuse (only if needed to save memory)
-        return img, txt, (k, v) if need_cache else None
+        return img, txt, kv_cache
 
 
 class MMSingleStreamBlock(nn.Module):
@@ -475,10 +480,16 @@ class MMSingleStreamBlock(nn.Module):
             )
         # attention computation end
 
+        # Cache K,V if needed, then immediately free memory
+        kv_cache = (k, v) if need_cache else None
+        del k, v
+
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        del attn  # Free attention output after use
+
         # Return current K,V for next step to reuse (only if needed to save memory)
-        return x + apply_gate(output, gate=mod_gate), (k, v) if need_cache else None
+        return x + apply_gate(output, gate=mod_gate), kv_cache
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
