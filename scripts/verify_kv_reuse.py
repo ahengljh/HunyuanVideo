@@ -355,17 +355,20 @@ def main():
     logger.info("Loading HunyuanVideo model...")
     sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
 
-    # Wrap scheduler.step to track denoising steps
-    original_scheduler_step = sampler.pipeline.scheduler.step
+    # Wrap the transformer forward to track denoising steps
+    # The transformer is called once per denoising step, so we increment
+    # the step counter AFTER each transformer forward pass completes
+    original_transformer_forward = sampler.pipeline.transformer.forward
 
-    def tracked_scheduler_step(model_output, timestep, sample, *args, **kwargs):
-        result = original_scheduler_step(model_output, timestep, sample, *args, **kwargs)
-        # After each step, increment the step counter
-        tracker.current_step += 1
+    def tracked_transformer_forward(*args, **kwargs):
+        # Reset block counter at start of each transformer forward (new step)
         tracker.block_counter = 0
+        result = original_transformer_forward(*args, **kwargs)
+        # Increment step counter after transformer forward completes
+        tracker.current_step += 1
         return result
 
-    sampler.pipeline.scheduler.step = tracked_scheduler_step
+    sampler.pipeline.transformer.forward = tracked_transformer_forward
 
     # Configure generation parameters
     # Use small size for faster verification
