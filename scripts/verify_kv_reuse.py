@@ -369,11 +369,21 @@ def main():
 
     # Configure generation parameters
     # Use small size for faster verification
-    height = getattr(args, 'height', 256) or 256
-    width = getattr(args, 'width', 256) or 256
+    # Get video_size which is a tuple (height, width)
+    video_size = getattr(args, 'video_size', (256, 256))
+    if isinstance(video_size, (list, tuple)) and len(video_size) >= 2:
+        height = video_size[0]
+        width = video_size[1]
+    else:
+        height = 256
+        width = 256
+
     video_length = getattr(args, 'video_length', 9) or 9
     infer_steps = getattr(args, 'infer_steps', 10) or 10
     prompt = getattr(args, 'prompt', None) or "a serene lake with mountains in the background, calm water, blue sky"
+    embedded_cfg_scale = getattr(args, 'embedded_cfg_scale', 6.0)
+    cfg_scale = getattr(args, 'cfg_scale', 1.0)
+    flow_shift = getattr(args, 'flow_shift', 7.0)
 
     logger.info(f"Generation config: {height}x{width}, {video_length} frames, {infer_steps} steps")
     logger.info(f"Prompt: {prompt}")
@@ -401,6 +411,9 @@ def main():
             infer_steps=infer_steps,
             seed=42,
             negative_prompt="blurry, low quality",
+            guidance_scale=cfg_scale,
+            embedded_guidance_scale=embedded_cfg_scale,
+            flow_shift=flow_shift,
         )
         logger.info("Generation complete!")
     except Exception as e:
